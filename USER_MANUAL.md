@@ -873,31 +873,37 @@ jianti-exam-system/
 双击项目根目录的 `deploy-windows.bat`（或在命令行执行 `node scripts/deploy/deploy-windows.mjs`）。脚本会：
 
 1. 检查 Node 版本（需 >= 22.13.0）
-2. 执行 `npm install`（node_modules 已存在时跳过）
-3. 执行 `npm run build`（生产构建）
-4. 后台启动全栈服务（Web http://127.0.0.1:3050 / API http://127.0.0.1:3051）
-5. 轮询 `http://127.0.0.1:3050/api/ready` 等待就绪
-6. 打印访问地址与后续步骤
+2. **清理残留实例**（PID 文件 + 端口 3050/3051 扫描 + 进程名匹配）
+3. 缺 `node_modules` 时自动 `npm ci --omit=dev`
+4. **智能 build**：扫描 `.next/BUILD_ID` 时间戳 vs 所有源码 + 配置文件 mtime → **`.next` 比源码新则跳过 build（二次启动约 6 秒）**，否则自动 `npm run build`（约 25 秒）
+5. 后台启动全栈服务（Web http://127.0.0.1:3050 / API http://127.0.0.1:3051）
+6. 轮询 `http://127.0.0.1:3050/api/ready` 等待就绪
+7. 打印访问地址与后续步骤
 
-成功后会显示：
+**可选参数**（直接调 mjs 时）：
+
+```powershell
+node scripts/deploy/deploy-windows.mjs --force-build   # 强制重建（改了 next.config / tailwind 时用）
+node scripts/deploy/deploy-windows.mjs --skip-build    # 跳过 build（确信 .next 好的）
+```
+
+成功后会显示（**二次启动示例，跳过了 build**）：
 
 ```
-[INFO] Node.js 版本: v26.13.1
-[INFO] 构建生产环境 (npm run build) ...
-[start] 启动服务 (Web http://127.0.0.1:3050 / API http://127.0.0.1:3051)，已切到后台运行 ...
+[INFO] Node.js: v26.13.1
+[INFO] node_modules present, skipping npm ci
+[INFO] .next built at 2026/11/23 22:17:00
+[INFO] .next is fresh, skipping build. (Use --force-build to rebuild anyway)
+[start] Launching background (Web http://127.0.0.1:3050 / API :3051)
 
 ========================================
-  部署完成 — 服务已在后台运行
+  Deployed - service is running
 ========================================
-[URL] Web:  http://127.0.0.1:3050
-[URL] API:  http://127.0.0.1:3051
-[URL] 健康: GET http://127.0.0.1:3050/api/ready
+[URL] Web:     http://127.0.0.1:3050
+[URL] API:     http://127.0.0.1:3051
+[URL] Health:  GET http://127.0.0.1:3050/api/ready
 
-[next] 首次使用：浏览器打开 http://127.0.0.1:3050 ，
-       没有账号可去 http://127.0.0.1:3050/register 注册，
-       第一个注册的教师自动成为 admin。
-
-[stop] 停止服务：node scripts/stop-local.mjs
+[stop] node scripts/stop-local.mjs
 ```
 
 首次使用：访问 `http://127.0.0.1:3050`，去 `/register` 注册第一个教师（即 admin）并登录。

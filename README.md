@@ -48,6 +48,22 @@ deploy-windows.bat
 # 打开 http://127.0.0.1:3050
 ```
 
+脚本自动：清理残留实例 → 缺 `node_modules` 自动 `npm ci` → **`.next` 比源码新则跳过 build（6 秒起），否则自动 build（~25 秒）** → 后台启动 → 轮询就绪。二次启动几乎瞬间完成。
+
+可选参数（直接调用 mjs）：
+
+```powershell
+node scripts/deploy/deploy-windows.mjs --force-build   # 强制重建（改了构建配置时用）
+node scripts/deploy/deploy-windows.mjs --skip-build    # 跳过 build（.next 肯定好的）
+```
+
+前台启动（窗口保持开着，关了就停）：
+
+```cmd
+scripts\start-local.bat
+# 同样会自动清理 + 智能跳过 build
+```
+
 ### 方式 C · Windows NSSM 开机服务（生产）
 
 ```powershell
