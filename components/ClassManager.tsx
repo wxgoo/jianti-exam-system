@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { Download, GraduationCap, Plus, Search, Trash2, Upload, Users } from "lucide-react";
+import { Download, GraduationCap, Pencil, Plus, Search, Trash2, Upload, Users, X } from "lucide-react";
 import type { TeachingClassRecord } from "../lib/school-workflow";
 
 type Student = { id: string; studentNo: string; name: string; seatNumber: string | null };
@@ -26,6 +26,10 @@ export function ClassManager({ initialClasses, initialDetail }: { initialClasses
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const [addingStudent, setAddingStudent] = useState(false);
+  const [studentForm, setStudentForm] = useState({ studentNo: "", name: "", seatNumber: "" });
+  const [editingStudentId, setEditingStudentId] = useState<string | null>(null);
+  const [editStudentForm, setEditStudentForm] = useState({ studentNo: "", name: "", seatNumber: "" });
 
   async function loadDetail(classId: string) {
     const sequence = ++requestSequence.current;
@@ -73,6 +77,32 @@ export function ClassManager({ initialClasses, initialDetail }: { initialClasses
       await requestJson(`/api/classes/${detail.id}`, { method: "DELETE" });
       setClasses(items => items.filter(item => item.id !== detail.id));
       setDetail(null); setSelectedId(null);
+    });
+  }
+
+  async function addStudent() {
+    if (!detail) return;
+    if (!studentForm.studentNo.trim() || !studentForm.name.trim()) { setError("学号和姓名必填"); return; }
+    await mutate(async () => {
+      const result = await requestJson(`/api/classes/${detail.id}/students`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(studentForm) });
+      await loadDetail(detail.id);
+      setClasses(items => items.map(item => item.id === detail.id ? { ...item, studentCount: (item.studentCount || 0) + 1 } : item));
+      setAddingStudent(false); setStudentForm({ studentNo: "", name: "", seatNumber: "" });
+      setError(`已添加，学号 ${result.inserted ? "新建" : "已存在"}`);
+    });
+  }
+
+  function startEditStudent(s: Student) {
+    setEditingStudentId(s.id);
+    setEditStudentForm({ studentNo: s.studentNo, name: s.name, seatNumber: s.seatNumber ?? "" });
+  }
+
+  async function saveEditStudent() {
+    if (!detail || !editingStudentId) return;
+    await mutate(async () => {
+      await requestJson(`/api/classes/${detail.id}/students/${editingStudentId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(editStudentForm) });
+      await loadDetail(detail.id);
+      setEditingStudentId(null);
     });
   }
 
@@ -125,9 +155,10 @@ export function ClassManager({ initialClasses, initialDetail }: { initialClasses
     {error && !creating && <p role="alert" className="school-inline-error">{error}</p>}<div className="class-manager-shell">
       <aside className="class-list-panel"><div><strong>我的班级</strong><small>{classes.filter((item) => !item.archived).length} 个在教班级</small></div><label><input type="checkbox" checked={showArchived} disabled={busy} onChange={event => setShowArchived(event.target.checked)} /> 显示已归档</label>{classes.filter((item) => showArchived || !item.archived).map((item) => <button type="button" className={item.id === selectedId ? "active" : ""} key={item.id} disabled={busy} onClick={() => void selectClass(item.id)}><span>{item.name.slice(0, 1)}</span><div><strong>{item.name}{item.archived ? "（归档）" : ""}</strong><small>{item.grade} · {item.subject}</small></div><b>{item.studentCount} 人</b></button>)}{!classes.length && <p className="class-list-empty">先建立一个任教班级。</p>}</aside>
       <main className="class-detail-panel">
-        {detail ? <><header><div><h2>{detail.name}</h2><p>{detail.schoolYear} 学年 · {detail.grade} · {detail.subject}</p></div><div className="class-roster-actions"><button className="btn btn-small" disabled={busy} onClick={() => { setForm({ name: detail.name, grade: detail.grade, subject: detail.subject, schoolYear: detail.schoolYear }); setEditing(true); setCreating(true); }}>编辑班级</button><button className="btn btn-small" disabled={busy} onClick={() => void archiveClass()}>{detail.archived ? "恢复班级" : "归档班级"}</button><button type="button" className="btn btn-small btn-danger" disabled={busy} onClick={() => void deleteClass()}><Trash2 size={13} /> 删除班级</button><button type="button" className="btn btn-small" onClick={downloadTemplate}><Download size={13} /> 名单模板</button><button type="button" className="btn btn-primary btn-small" disabled={busy || Boolean(detail.archived)} onClick={() => fileRef.current?.click()}><Upload size={13} /> {busy ? "导入中…" : "导入 CSV"}</button><input ref={fileRef} hidden type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importRoster(file); event.currentTarget.value = ""; }} /></div></header><div className="class-roster-toolbar"><label><Search size={14} /><input aria-label="搜索学生" placeholder="搜索姓名、学号或座号" value={search} onChange={(event) => setSearch(event.target.value)} /></label><span><Users size={14} /> {detail.students.length} 名学生</span></div>{error && <p className="school-inline-error">{error}</p>}<div className="roster-table"><div className="roster-head"><span>座号</span><span>学号</span><span>姓名</span><span>操作</span></div>{visibleStudents.map((student) => <div className="roster-row" key={student.id}><span>{student.seatNumber ?? "—"}</span><span>{student.studentNo}</span><strong>{student.name}</strong><button type="button" disabled={busy || Boolean(detail.archived)} title="从班级移除" aria-label={`移除${student.name}`} onClick={() => void removeStudent(student)}><Trash2 size={13} /></button></div>)}</div>{!detail.students.length && <div className="school-empty"><Users size={32} /><h2>班级还没有学生</h2><p>下载模板填好学号、姓名与座号，再导入 CSV。</p><button className="btn btn-primary" type="button" onClick={() => fileRef.current?.click()}><Upload size={14} /> 导入名单</button></div>}</> : <div className="school-empty"><GraduationCap size={34} /><h2>建立第一个班级</h2><p>班级是作业、成绩与错题分析的归属单位。</p><button className="btn btn-primary" type="button" onClick={openCreate}><Plus size={14} /> 新建班级</button></div>}
+        {detail ? <><header><div><h2>{detail.name}</h2><p>{detail.schoolYear} 学年 · {detail.grade} · {detail.subject}</p></div><div className="class-roster-actions"><button className="btn btn-small" disabled={busy} onClick={() => { setForm({ name: detail.name, grade: detail.grade, subject: detail.subject, schoolYear: detail.schoolYear }); setEditing(true); setCreating(true); }}>编辑班级</button><button className="btn btn-small" disabled={busy} onClick={() => void archiveClass()}>{detail.archived ? "恢复班级" : "归档班级"}</button><button type="button" className="btn btn-small btn-danger" disabled={busy} onClick={() => void deleteClass()}><Trash2 size={13} /> 删除班级</button><button type="button" className="btn btn-small" onClick={downloadTemplate}><Download size={13} /> 名单模板</button><button type="button" className="btn btn-primary btn-small" disabled={busy || Boolean(detail.archived)} onClick={() => fileRef.current?.click()}><Upload size={13} /> {busy ? "导入中…" : "导入 CSV"}</button><input ref={fileRef} hidden type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importRoster(file); event.currentTarget.value = ""; }} /></div></header><div className="class-roster-toolbar"><label><Search size={14} /><input aria-label="搜索学生" placeholder="搜索姓名、学号或座号" value={search} onChange={(event) => setSearch(event.target.value)} /></label><span><Users size={14} /> {detail.students.length} 名学生</span><button type="button" className="btn btn-small" disabled={busy || Boolean(detail.archived)} onClick={() => { setStudentForm({ studentNo: "", name: "", seatNumber: "" }); setAddingStudent(true); setError(""); }}><Plus size={13} /> 添加单个学生</button></div>{error && <p className="school-inline-error">{error}</p>}<div className="roster-table"><div className="roster-head"><span>座号</span><span>学号</span><span>姓名</span><span>操作</span></div>{visibleStudents.map((student) => editingStudentId === student.id ? <div className="roster-row editing" key={`edit-${student.id}`}><span><input aria-label="座号" value={editStudentForm.seatNumber} onChange={(event) => setEditStudentForm({ ...editStudentForm, seatNumber: event.target.value })} /></span><span><input aria-label="学号" value={editStudentForm.studentNo} onChange={(event) => setEditStudentForm({ ...editStudentForm, studentNo: event.target.value })} /></span><span><input aria-label="姓名" value={editStudentForm.name} onChange={(event) => setEditStudentForm({ ...editStudentForm, name: event.target.value })} /></span><button type="button" className="btn btn-small" disabled={busy} onClick={() => void saveEditStudent()}>保存</button><button type="button" className="btn btn-small" onClick={() => setEditingStudentId(null)}>取消</button></div> : <div className="roster-row" key={student.id}><span>{student.seatNumber ?? "—"}</span><span>{student.studentNo}</span><strong>{student.name}</strong><button type="button" disabled={busy || Boolean(detail.archived) || Boolean(editingStudentId)} title="编辑学生" aria-label={`编辑${student.name}`} onClick={() => startEditStudent(student)}><Pencil size={13} /></button><button type="button" disabled={busy || Boolean(detail.archived)} title="从班级移除" aria-label={`移除${student.name}`} onClick={() => void removeStudent(student)}><Trash2 size={13} /></button></div>)}</div>{!detail.students.length && <div className="school-empty"><Users size={32} /><h2>班级还没有学生</h2><p>下载模板填好学号、姓名与座号，再导入 CSV。</p><button className="btn btn-primary" type="button" onClick={() => fileRef.current?.click()}><Upload size={14} /> 导入名单</button></div>}</> : <div className="school-empty"><GraduationCap size={34} /><h2>建立第一个班级</h2><p>班级是作业、成绩与错题分析的归属单位。</p><button className="btn btn-primary" type="button" onClick={openCreate}><Plus size={14} /> 新建班级</button></div>}
       </main>
     </div>
     {creating && <div className="school-modal" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreating(false); }}><form role="dialog" aria-modal="true" aria-labelledby="create-class-title" onSubmit={(event) => { event.preventDefault(); void createClass(); }}><h2 id="create-class-title">{editing ? "编辑班级" : "新建任教班级"}</h2><p>学年与班名用于区分历届班级，后续可归档。</p><label><span>班级名称</span><input autoFocus placeholder="例如：高一（3）班" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label><div className="school-form-grid"><label><span>年级</span><input placeholder="例如：高一" value={form.grade} onChange={(event) => setForm({ ...form, grade: event.target.value })} /></label><label><span>学科</span><input value={form.subject} onChange={(event) => setForm({ ...form, subject: event.target.value })} /></label></div><label><span>学年</span><input value={form.schoolYear} onChange={(event) => setForm({ ...form, schoolYear: event.target.value })} /></label>{error && <p className="school-inline-error">{error}</p>}<footer><button type="button" className="btn" onClick={() => setCreating(false)}>取消</button><button type="submit" className="btn btn-primary" disabled={busy || !form.name.trim() || !form.grade.trim()}>{busy ? "保存中…" : "保存班级"}</button></footer></form></div>}
+    {addingStudent && <div className="school-modal" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddingStudent(false); }}><form role="dialog" aria-modal="true" aria-labelledby="add-student-title" onSubmit={(event) => { event.preventDefault(); void addStudent(); }}><h2 id="add-student-title">添加单个学生</h2><p>如果该学号已在你名下其他班级建档，会自动关联。</p><label><span>学号</span><input autoFocus placeholder="例如：2026001" value={studentForm.studentNo} onChange={(event) => setStudentForm({ ...studentForm, studentNo: event.target.value })} /></label><label><span>姓名</span><input placeholder="例如：张同学" value={studentForm.name} onChange={(event) => setStudentForm({ ...studentForm, name: event.target.value })} /></label><label><span>座号（可选）</span><input placeholder="例如：1" value={studentForm.seatNumber} onChange={(event) => setStudentForm({ ...studentForm, seatNumber: event.target.value })} /></label>{error && <p className="school-inline-error">{error}</p>}<footer><button type="button" className="btn" onClick={() => setAddingStudent(false)}>取消</button><button type="submit" className="btn btn-primary" disabled={busy || !studentForm.studentNo.trim() || !studentForm.name.trim()}>{busy ? "添加中…" : "添加到本班"}</button></footer></form></div>}
   </div>;
 }

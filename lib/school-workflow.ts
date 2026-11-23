@@ -113,6 +113,58 @@ export async function removeStudentFromClass(ownerId: string, classId: string, s
   return { removed: true };
 }
 
+export async function addStudentToClass(ownerId: string, classId: string, input: { studentNo?: unknown; name?: unknown; seatNumber?: unknown }) {
+  await ensureDatabase();
+  const studentNo = typeof input.studentNo === "string" ? input.studentNo.trim() : "";
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+  const seatNumber = typeof input.seatNumber === "string" && input.seatNumber.trim() ? input.seatNumber.trim() : null;
+  if (!studentNo || studentNo.length > 32) throw new Error("学号需为 1-32 字符");
+  if (!name || name.length > 32) throw new Error("姓名需为 1-32 字符");
+  const timestamp = now();
+  const result = sqliteTransaction((sqlite) => {
+    const classRow = sqlite.prepare("SELECT archived FROM teaching_classes WHERE id = ? AND owner_id = ?").get(classId, ownerId) as { archived: number } | undefined;
+    if (!classRow) throw new Error("班级不存在");
+    if (classRow.archived) throw new Error("班级已归档，无法添加学生");
+    const existing = sqlite.prepare("SELECT id, name FROM students WHERE owner_id = ? AND student_no = ?").get(ownerId, studentNo) as { id: string; name: string } | undefined;
+    if (existing && existing.name !== name) throw new Error(`学号“${studentNo}”已属于“${existing.name}”，与“${name}”冲突`);
+    const studentId = existing?.id ?? crypto.randomUUID();
+    if (!existing) sqlite.prepare("INSERT INTO students (id, owner_id, student_no, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(studentId, ownerId, studentNo, name, timestamp, timestamp);
+    sqlite.prepare(`INSERT INTO class_students (class_id, student_id, seat_number, joined_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(class_id, student_id) DO UPDATE SET seat_number = excluded.seat_number`).run(classId, studentId, seatNumber, timestamp);
+    sqlite.prepare("UPDATE teaching_classes SET updated_at = ? WHERE id = ?").run(timestamp, classId);
+    return { studentId, inserted: !existing };
+  });
+  return result;
+}
+
+export async function updateStudentInClass(ownerId: string, classId: string, studentId: string, input: { studentNo?: unknown; name?: unknown; seatNumber?: unknown }) {
+  await ensureDatabase();
+  const db = getSqlite();
+  // verify ownership
+  const link = db.prepare(`SELECT cs.seat_number, s.student_no AS student_no, s.name AS name
+    FROM class_students cs JOIN students s ON s.id = cs.student_id
+    WHERE cs.class_id = ? AND cs.student_id = ? AND EXISTS (SELECT 1 FROM teaching_classes WHERE id = cs.class_id AND owner_id = ?)`).get(classId, studentId, ownerId) as { seat_number: string | null; student_no: string; name: string } | undefined;
+  if (!link) throw new Error("学生或班级不存在");
+
+  const newStudentNo = typeof input.studentNo === "string" && input.studentNo.trim() ? input.studentNo.trim() : link.student_no;
+  const newName = typeof input.name === "string" && input.name.trim() ? input.name.trim() : link.name;
+  const newSeat = typeof input.seatNumber === "string" ? (input.seatNumber.trim() || null) : link.seat_number;
+
+  if (newStudentNo.length > 32 || newName.length > 32) throw new Error("学号和姓名不能超过 32 字符");
+
+  const timestamp = now();
+  sqliteTransaction((sqlite) => {
+    // If changing studentNo → check no other student in the same scope has it with different name
+    if (newStudentNo !== link.student_no) {
+      const conflict = sqlite.prepare("SELECT id, name FROM students WHERE owner_id = ? AND student_no = ? AND id != ?").get(ownerId, newStudentNo, studentId) as { id: string; name: string } | undefined;
+      if (conflict && conflict.name !== newName) throw new Error(`学号“${newStudentNo}”已属于“${conflict.name}”`);
+    }
+    sqlite.prepare("UPDATE students SET student_no = ?, name = ?, updated_at = ? WHERE id = ? AND owner_id = ?").run(newStudentNo, newName, timestamp, studentId, ownerId);
+    sqlite.prepare("UPDATE class_students SET seat_number = ? WHERE class_id = ? AND student_id = ?").run(newSeat, classId, studentId);
+  });
+  return { ok: true };
+}
+
 export async function listAssignments(ownerId: string) {
   await ensureDatabase();
   return getSqlite().prepare(

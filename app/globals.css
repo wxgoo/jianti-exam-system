@@ -957,6 +957,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .roster-head { min-height: 34px; background: #f5f8f6; color: #708079; font-size: 9px; font-weight: 700; }.roster-head span,.roster-row > * { padding: 0 13px; }
 .roster-row { min-height: 44px; border-top: 1px solid #edf0ee; font-size: 10px; }.roster-row:hover { background: #fbfcfb; }.roster-row strong { font-size: 11px; }
 .roster-row button { width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 7px; background: transparent; color: #a0aaa5; cursor: pointer; }.roster-row button:hover { background: #fff0eb; color: #b65435; }
+.roster-row.editing { background: #f0f7f3 !important; grid-template-columns: 1fr 1.4fr 1fr auto auto; gap: 6px; padding: 0 8px; }
+.roster-row.editing > span, .roster-row.editing > strong { padding: 0; }
+.roster-row.editing input { width: 100%; padding: 4px 8px; border: 1px solid #c8d6ce; border-radius: 5px; font-size: 11px; background: white; }
+.roster-row.editing input:focus { outline: none; border-color: #69a98d; box-shadow: 0 0 0 2px rgba(105,169,141,.18); }
 .school-modal { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(13,32,29,.46); backdrop-filter: blur(3px); }
 .school-modal form { width: min(460px,100%); border: 1px solid #dbe3df; border-radius: 16px; padding: 22px; background: white; box-shadow: 0 28px 70px rgba(10,32,27,.22); }
 .school-modal h2 { margin: 0 0 5px; font-size: 20px; }.school-modal form > p { margin: 0 0 17px; color: var(--muted); font-size: 10px; }
