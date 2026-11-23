@@ -695,7 +695,15 @@ export function QuestionBank({
       <div className="resource-tabs" role="tablist" aria-label="题库范围"><button role="tab" aria-selected={library === "platform"} onClick={() => setLibrary("platform")}>基础题库</button><button role="tab" aria-selected={library === "personal"} onClick={() => setLibrary("personal")}>我的题库</button>{library === "personal" && <button className="resource-folder-toggle" aria-expanded={foldersOpen} onClick={() => setFoldersOpen(!foldersOpen)}><Folder size={15} /> 文件夹管理</button>}</div>
       {library === "platform" && <section className="resource-unavailable">
         <div className="bank-platform-categories" role="tablist" aria-label="平台资源分类"><button role="tab" aria-selected={platformCategory === "model"} onClick={() => setPlatformCategory("model")}>模卷</button><button role="tab" aria-selected={platformCategory === "school"} onClick={() => setPlatformCategory("school")}>名校试卷</button></div>
-        <h2>平台精选资源尚未开放</h2><p>{platformCategory === "model" ? "模卷将按教学与考试场景组织。" : "名校试卷将按学校与试卷来源组织。"}目前还没有可供浏览的已发布资源。</p><p>个人上传、共享包和 AI 变式保存在「我的题库」，已有选题篮会继续保留。</p><button className="btn" onClick={() => setLibrary("personal")}>浏览我的题库</button>
+        <h2>平台精选资源（规划中）</h2>
+        <p>跨学校共享的模卷 / 名校试卷聚合池，后续版本开放。目前请用以下方式入库：</p>
+        <ul className="resource-unavailable-hints">
+          <li>📂 上传 Word/PDF 原卷 → 自动识别题目</li>
+          <li>🔍 第一试卷网在线抓卷 → 弹窗内直接搜 + 自动入库（见顶部「找题 / 下载」按钮）</li>
+          <li>🧪 组卷网 / 学科网 → 油猴脚本导出后导入</li>
+        </ul>
+        <p>你自己的题目、导入的试卷、AI 变式题都在「我的题库」里永久保存。</p>
+        <button className="btn" onClick={() => setLibrary("personal")}>浏览我的题库</button>
       </section>}
       {library === "personal" && <>
       {(notice || operationError) && <div className={`bank-notice ${operationError ? "error" : "success"}`}><span>{operationError || notice}</span><button type="button" onClick={() => { setNotice(""); setOperationError(""); }}><X size={13} /></button></div>}

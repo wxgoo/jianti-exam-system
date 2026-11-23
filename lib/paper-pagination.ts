@@ -49,9 +49,12 @@ export function paginatePaper(blocks: MeasuredPaperBlock[], pageHeight: number, 
     let heading = previousSection !== block.sectionId;
     const size = () => {
       const headingHeight = heading ? block.headingHeight : 0;
-      // Reserve half the printable page for writing alone. Neither the prompt
-      // nor unused space beside its figures reduces this minimum.
-      const blank = block.answer ? Math.max(pageHeight / 2, block.contentHeight, block.minimumBlank) : 0;
+      // 答题卡书写空白自适应：小题 12% 页高，大题最多 25% 页高。
+      // 旧设计硬塞 pageHeight/2（半页），导致综合题一道题吃掉一页。
+      // 多道综合题答题卡改为 25% 上限后，一页可排 3-4 道。
+      const blank = block.answer
+        ? Math.min(pageHeight * 0.25, Math.max(pageHeight * 0.12, block.minimumBlank))
+        : 0;
       return { blank, height: headingHeight + block.contentHeight + blank + (block.answer ? 0 : gap) };
     };
     let dimensions = size();
