@@ -45,7 +45,7 @@ function start(label, commandArgs, extraEnv = {}, executable = process.execPath)
     const index = children.indexOf(child);
     if (index >= 0) children.splice(index, 1);
     if (stopping) return;
-    if (label === "api" || label === "worker" || label === "processor") {
+    if (label === "api" || label === "worker" || label === "processor" || label === "web") {
       const previous = restarts.get(label);
       const count = previous && Date.now() - previous.at < 60000 ? previous.count + 1 : 1;
       restarts.set(label, { count, at: Date.now() });
