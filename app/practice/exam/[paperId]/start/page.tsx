@@ -1,12 +1,13 @@
 "use client";
 
-import { useRouter } from "next/navigation";
+import { useRouter, useParams } from "next/navigation";
 import Link from "next/link";
 import { useState } from "react";
 
-export default function ExamSetDurationPage({ params }: { params: { paperId: string } }) {
+export default function ExamSetDurationPage() {
   const router = useRouter();
-  const paperId = params.paperId;
+  const params = useParams<{ paperId: string }>();
+  const paperId = params?.paperId ?? "";
   const [duration, setDuration] = useState(60);
   const [busy, setBusy] = useState(false);
 

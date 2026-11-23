@@ -1,12 +1,14 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useParams } from "next/navigation";
 import { MathText } from "@/components/MathText";
 import { typeLabels } from "@/lib/question-labels";
 
-export default function PracticeSessionPage({ sessionId }: { sessionId: string }) {
+export default function PracticeSessionPage() {
   const router = useRouter();
+  const params = useParams<{ sessionId: string }>();
+  const sessionId = params?.sessionId ?? "";
   const [session, setSession] = useState<any>(null);
   const [questions, setQuestions] = useState<any[]>([]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
