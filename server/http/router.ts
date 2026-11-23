@@ -56,7 +56,7 @@ export async function dispatchRequest(request: Request): Promise<Response> {
   const startedAt = performance.now();
   const requestId = crypto.randomUUID();
   let response: Response;
-  if (!["GET", "HEAD"].includes(request.method) && request.headers.get("content-type")?.includes("application/json")) {
+  if (["POST", "PATCH", "PUT"].includes(request.method) && request.headers.get("content-type")?.includes("application/json")) {
     const payload = await request.clone().json().catch(() => null);
     if (!z.record(z.string(), z.unknown()).safeParse(payload).success) {
       response = toResponse(result({ error: "请求内容必须是有效的 JSON 对象", requestId }, { status: 400 }));
