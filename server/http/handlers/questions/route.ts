@@ -4,30 +4,36 @@ import { sqliteTransaction } from "../../../../db";
 import { ensureDatabase } from "../../../../db/bootstrap";
 import { deleteFile } from "../../../../lib/file-storage";
 import { deleteQuestions, normalizeQuestionIds, QuestionBulkActionError } from "../../../../lib/question-bulk-actions";
-import { now, requestOwner } from "../../../../lib/server";
+import { now, requestOwner, requestTeacherSession } from "../../../../lib/server";
 
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const year = Number(url.searchParams.get("year")) || undefined;
-  const result = await searchApprovedQuestions(requestOwner(request), {
+  const session = requestTeacherSession(request);
+  const isAdmin = session?.role === "admin";
+
+  // 管理员不受 subject/stage/grade/year 等 scope 限制 —— 看到全库
+  // （前端会强制带 subject/stage，admin 需显式忽略）
+  const opts = {
     sourceKind: url.searchParams.get("sourceKind") ?? undefined,
     query: url.searchParams.get("q") ?? undefined,
     type: url.searchParams.get("type") ?? undefined,
     tag: url.searchParams.get("tag") ?? undefined,
     documentId: url.searchParams.get("documentId") ?? undefined,
-    subject: requestEducationScope(request).subject,
+    subject: isAdmin ? undefined : requestEducationScope(request).subject,
     grade: url.searchParams.get("grade") ?? undefined,
-    stage: requestEducationScope(request).stage,
-    year,
-    examType: url.searchParams.get("examType") ?? undefined,
-    region: url.searchParams.get("region") ?? undefined,
-    textbook: url.searchParams.get("textbook") ?? undefined,
-    school: url.searchParams.get("school") ?? undefined,
+    stage: isAdmin ? undefined : requestEducationScope(request).stage,
+    year: isAdmin ? undefined : (Number(url.searchParams.get("year")) || undefined),
+    examType: isAdmin ? undefined : (url.searchParams.get("examType") ?? undefined),
+    region: isAdmin ? undefined : (url.searchParams.get("region") ?? undefined),
+    textbook: isAdmin ? undefined : (url.searchParams.get("textbook") ?? undefined),
+    school: isAdmin ? undefined : (url.searchParams.get("school") ?? undefined),
     folderId: url.searchParams.get("folderId") ?? undefined,
     page: Number(url.searchParams.get("page")) || 1,
     pageSize: Number(url.searchParams.get("pageSize")) || 30,
-  });
+  };
+  const result = await searchApprovedQuestions(requestOwner(request), opts);
   return Response.json(result, { headers: { "cache-control": "no-store" } });
 }
 

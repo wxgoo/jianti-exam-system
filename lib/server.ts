@@ -13,11 +13,8 @@ export function runtimeEnv(): RuntimeConfig {
 }
 
 export function requestOwner(request: Request) {
-  const tenant = tenantContext.getStore();
-  if (tenant) return tenant.ownerId;
-  if (process.env.JIANTI_DEPLOYMENT_MODE === "remote") throw new Error("远端请求缺少已验证的租户上下文");
-
-  // 优先从 Cookie Session 获取教师 ID（多租户模式）
+  // 本地部署优先：Cookie Session → teacherId（多教师/管理员场景）
+  // 再考虑 tenantContext（多租户远端部署）
   const cookie = request.headers.get("cookie");
   if (cookie) {
     const match = cookie.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
@@ -26,6 +23,10 @@ export function requestOwner(request: Request) {
       if (session) return session.teacherId;
     }
   }
+
+  const tenant = tenantContext.getStore();
+  if (tenant) return tenant.ownerId;
+  if (process.env.JIANTI_DEPLOYMENT_MODE === "remote") throw new Error("远端请求缺少已验证的租户上下文");
 
   return request.headers.get("oai-authenticated-user-id") ?? "local-demo";
 }
