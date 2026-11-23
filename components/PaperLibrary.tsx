@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { CalendarPlus, ChevronRight, FilePlus2, FileText, Files, Folder, FolderPlus, Inbox, MoreHorizontal, Pencil, Plus, Search, Trash2 } from "lucide-react";
+import { CalendarPlus, ChevronRight, FilePlus2, FileText, Files, Folder, FolderPlus, Inbox, MoreHorizontal, Pencil, Play, Plus, Search, Trash2 } from "lucide-react";
 import { stageLabel } from "../lib/education-taxonomy";
 import type { PaperFolderRecord, PaperLibraryRecord } from "../lib/paper-library";
 import { SelectionCheckbox } from "./SelectionCheckbox";
@@ -320,7 +320,7 @@ export function PaperLibrary({ initialFolders, initialPapers, requestedFolderId 
               <td>{paper.questionCount} 题{uploaded && paper.questionCount > paper.approvedCount && <small>{paper.approvedCount} 题已入库</small>}</td><td><span className="asset-status">{status}</span></td><td><time dateTime={paper.updatedAt}>{formatTime(paper.updatedAt)}</time></td>
               <td><div className="asset-row-actions">{uploaded ? <Link href={previewUrl}>查看试卷</Link> : <Link href={editUrl}>继续编辑</Link>}
                 <details className="asset-menu" open={openMenu === menuKey} onToggle={event => menuToggle(menuKey, event.currentTarget)}><summary aria-label={`${paper.title} 操作`}><MoreHorizontal size={18} /></summary><div>
-                  {uploaded ? <>{paper.originalUrl && <a href={paper.originalUrl} target="_blank" rel="noreferrer">查看原始试卷</a>}{!paper.sourceRemoved && <Link href={editUrl}>查看识别结果 / 审核</Link>}{paper.approvedCount > 0 && <Link href={`/bank?documentId=${paper.id}`}>进入相关题目</Link>}</> : <><Link href={`/papers/${paper.id}/preview`} target="_blank">预览试卷</Link><a href={`/api/papers/${paper.id}/pdf`}>下载试卷 PDF</a><a href={`/api/papers/${paper.id}/pdf?answers=1`}>下载答案解析</a><a href={`/api/papers/${paper.id}/docx`}>下载 Word</a><a href={`/api/papers/${paper.id}/tex`}>下载 LaTeX</a>{mode === "school" && <Link href={`/assignments/new?paper=${paper.id}`}><CalendarPlus size={13} /> 布置作业</Link>}</>}
+                  {uploaded ? <>{paper.originalUrl && <a href={paper.originalUrl} target="_blank" rel="noreferrer">查看原始试卷</a>}{!paper.sourceRemoved && <Link href={editUrl}>查看识别结果 / 审核</Link>}{paper.approvedCount > 0 && <Link href={`/bank?documentId=${paper.id}`}>进入相关题目</Link>}</> : <><Link href={`/practice/exam/${paper.id}/start`}><Play size={13} /> 进入练习</Link><Link href={`/papers/${paper.id}/preview`} target="_blank">预览试卷</Link><a href={`/api/papers/${paper.id}/pdf`}>下载试卷 PDF</a><a href={`/api/papers/${paper.id}/pdf?answers=1`}>下载答案解析</a><a href={`/api/papers/${paper.id}/docx`}>下载 Word</a><a href={`/api/papers/${paper.id}/tex`}>下载 LaTeX</a>{mode === "school" && <Link href={`/assignments/new?paper=${paper.id}`}><CalendarPlus size={13} /> 布置作业</Link>}</>}
                   <button disabled={busy} onClick={() => beginRename({ kind: uploaded ? "uploaded" : "paper", id: paper.id, name: paper.title })}>重命名</button>
                   <label>移动到文件夹<select aria-label={`移动${paper.title}`} disabled={busy} value={paper.folderId ?? ""} onChange={event => void run(() => movePaper(paper, event.target.value || null))}><option value="">未分文件夹</option>{folders.map(folder => <option key={folder.id} value={folder.id}>{folderPath(folder)}</option>)}</select></label>
                   {(!uploaded || !paper.sourceRemoved) && <button className="danger" disabled={busy} onClick={() => void run(() => removePaper(paper))}>{uploaded ? "删除原文件（保留题目）" : "删除组卷作品"}</button>}

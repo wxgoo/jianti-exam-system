@@ -467,6 +467,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .btn:hover { border-color: #b7c9c0; box-shadow: 0 9px 24px rgba(18,59,47,.1); }
 .btn-primary { border-color: var(--green); background: linear-gradient(180deg,#1d805d,#146b4e); box-shadow: 0 8px 18px rgba(23,117,84,.18); }
 .btn-primary:hover { border-color: #0e5c43; box-shadow: 0 11px 25px rgba(23,117,84,.23); }
+.btn-practice { background: linear-gradient(180deg,#2a60c8,#1d4aa0); border-color: #1d4aa0; color: white; box-shadow: 0 8px 18px rgba(29,74,160,.18); }
+.btn-practice:hover { border-color: #163d86; box-shadow: 0 11px 25px rgba(29,74,160,.23); }
+.btn-practice.disabled { background: #c9d2e2; border-color: #c9d2e2; color: #6b7486; box-shadow: none; pointer-events: none; opacity: .75; }
 .btn-small { min-height: 36px; border-radius: 10px; padding: 7px 11px; font-size: 12px; }
 .card { border-color: rgba(210,221,215,.9); border-radius: 20px; }
 .section-title { margin-bottom: 18px; }
