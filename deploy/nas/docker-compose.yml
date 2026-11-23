@@ -32,7 +32,7 @@ services:
     # ---- 远程镜像（推荐）----
     # 推 GitHub 后镜像路径自动是 ghcr.io/<你的Github用户名>/jianti-exam-system
     # 例：ghcr.io/yourname/jianti-exam-system:latest
-    image: ghcr.io/<你的Github用户名>/jianti-exam-system:latest
+    image: ghcr.io/wxgoo/jianti-exam-system:latest
     # 如果你还没推过远程镜像，注释掉 image 行 → 取消下面 build 的注释 走本地 build
     # build:
     #   context: ../..                     # 源码根目录

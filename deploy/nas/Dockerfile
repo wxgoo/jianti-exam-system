@@ -39,8 +39,9 @@ RUN set -eux; \
       || true; \
     rm -rf /var/lib/apt/lists/*
 
-# 安装 Node 依赖 + 生产构建
-RUN npm ci --omit=dev && npm run build
+# 先装完整依赖（tailwindcss/postcss 在 devDep 里，build 时需要），
+# 再 npm run build 出 .next 产物，最后 prune 掉 devDep 镜像更轻。
+RUN npm ci && npm run build && npm prune --omit=dev
 
 EXPOSE 3050 3051
 
