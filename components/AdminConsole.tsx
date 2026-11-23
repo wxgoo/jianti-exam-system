@@ -520,6 +520,8 @@ function AdminStudents() {
   const [formError, setFormError] = useState("");
   const [formOk, setFormOk] = useState("");
   const [delId, setDelId] = useState("");
+  const [editingId, setEditingId] = useState("");
+  const [editForm, setEditForm] = useState({ studentNo: "", name: "" });
 
   const create = async () => {
     setFormError(""); setFormOk("");
@@ -532,24 +534,41 @@ function AdminStudents() {
     if (!r.ok) alert(r.error);
     setDelId(""); void reload();
   };
+  const saveEdit = async () => {
+    const r = await api(`/api/admin/students/${editingId}`, { method: "PATCH", body: JSON.stringify(editForm) });
+    if (r.ok) { setEditingId(""); void reload(); }
+    else alert(r.error);
+  };
 
   if (loading && students.length === 0 && !error) return <p className="text-sm text-muted-foreground">加载中…</p>;
   if (error) return <p className="text-sm text-red-600">{error}</p>;
   return (
     <div className="space-y-4">
       <Section title={`学生（${students.length} 人）`}>
-        <div className="grid grid-cols-[0.9fr_1.2fr_0.6fr_1.2fr_auto] gap-2 px-3 py-2 text-xs text-muted-foreground">
-          <span>学号</span><span>姓名</span><span>班级数</span><span>所属教师</span><span>操作</span>
+        <div className="grid grid-cols-[0.9fr_1.2fr_0.6fr_1.2fr_auto_auto] gap-2 px-3 py-2 text-xs text-muted-foreground">
+          <span>学号</span><span>姓名</span><span>班级数</span><span>所属教师</span><span>编辑</span><span>删除</span>
         </div>
-        {students.map((s) => (
-          <div key={s.id} className="grid grid-cols-[0.9fr_1.2fr_0.6fr_1.2fr_auto] gap-2 items-center px-3 py-2 text-sm">
-            <span className="font-medium">{s.studentNo}</span>
-            <span className="truncate">{s.name}</span>
-            <span>{s.classCount}</span>
-            <span className="text-muted-foreground truncate">{s.ownerName ?? "-"}</span>
-            <span><button className={btnDanger} onClick={() => setDelId(s.id)}>删除</button></span>
-          </div>
-        ))}
+        {students.map((s) =>
+          editingId === s.id ? (
+            <div key={`edit-${s.id}`} className="grid grid-cols-[0.9fr_1.2fr_0.6fr_1.2fr_auto_auto] gap-2 items-center px-3 py-2 text-sm bg-muted/30 rounded">
+              <input className={inputClass} value={editForm.studentNo} onChange={(e) => setEditForm({ ...editForm, studentNo: e.target.value })} />
+              <input className={inputClass} value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} />
+              <span>{s.classCount}</span>
+              <span className="text-muted-foreground truncate">{s.ownerName ?? "-"}</span>
+              <button className={btnPrimary} onClick={() => void saveEdit()}>保存</button>
+              <button className={btnGhost} onClick={() => setEditingId("")}>取消</button>
+            </div>
+          ) : (
+            <div key={s.id} className="grid grid-cols-[0.9fr_1.2fr_0.6fr_1.2fr_auto_auto] gap-2 items-center px-3 py-2 text-sm">
+              <span className="font-medium">{s.studentNo}</span>
+              <span className="truncate">{s.name}</span>
+              <span>{s.classCount}</span>
+              <span className="text-muted-foreground truncate">{s.ownerName ?? "-"}</span>
+              <button className={btnGhost} onClick={() => { setEditingId(s.id); setEditForm({ studentNo: s.studentNo, name: s.name }); }}>编辑</button>
+              <button className={btnDanger} onClick={() => setDelId(s.id)}>删除</button>
+            </div>
+          )
+        )}
         {students.length === 0 && <div className="px-3 py-6 text-center text-sm text-muted-foreground">暂无学生</div>}
         {delId && (
           <div className="px-3 py-3 border-t space-y-2">

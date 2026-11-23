@@ -4,35 +4,38 @@ import { readJsonPayload } from "../../../../../../lib/request-payload";
 import { now } from "../../../../../../lib/server";
 import { adminForbidden, requireAdminSession } from "../../shared";
 
-export async function POST(request: Request, context: { params: Promise<{ studentId: string }> }) {
+type Context = { params: Promise<{ studentId: string }> };
+
+export async function PATCH(request: Request, context: Context) {
   await ensureDatabase();
   const session = requireAdminSession(request);
   if (!session) return adminForbidden();
   const { studentId } = await context.params;
-  if (studentId) return Response.json({ error: "无法创建" }, { status: 400 });
-  const parsed = await readJsonPayload<{ studentNo?: unknown; name?: unknown}>(request);
+  const parsed = await readJsonPayload<{ studentNo?: unknown; name?: unknown; ownerId?: unknown }>(request);
   if (!parsed.ok) return parsed.response;
   const sqlite = getSqlite();
   try {
-    const studentNo = typeof parsed.value.studentNo === "string" ? parsed.value.studentNo.trim() : "";
-    const name = typeof parsed.value.name === "string" ? parsed.value.name.trim() : "";
-    if (!studentNo || studentNo.length > 30 || /[-]/.test(studentNo)) throw new Error("学号格式无效");
-    if (!name || name.length > 20 || /[-]/.test(name)) throw new Error("学生姓名格式无效");
-    const ownerId = session.teacherId;
-    const existing = sqlite.prepare("SELECT 1 FROM students WHERE owner_id = ? AND student_no = ?").get(ownerId, studentNo);
-    if (existing) throw new Error("该学生已存在（同一教师下）");
-    const timestamp = now();
-    sqlite.prepare("INSERT INTO students (id, owner_id, student_no, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(
-      crypto.randomUUID(), ownerId, studentNo, name, timestamp, timestamp,
-    );
-    const row = sqlite.prepare("SELECT id, student_no AS studentNo, name FROM students WHERE owner_id = ? AND student_no = ?").get(ownerId, studentNo);
-    return Response.json({ student: row }, { status: 201 });
+    const row = sqlite.prepare("SELECT id, owner_id AS ownerId, student_no AS studentNo, name FROM students WHERE id = ?").get(studentId) as { id: string; ownerId: string; studentNo: string; name: string } | undefined;
+    if (!row) return Response.json({ error: "学生不存在" }, { status: 404 });
+    const studentNo = typeof parsed.value.studentNo === "string" && parsed.value.studentNo.trim() ? parsed.value.studentNo.trim() : row.studentNo;
+    const name = typeof parsed.value.name === "string" && parsed.value.name.trim() ? parsed.value.name.trim() : row.name;
+    const ownerId = typeof parsed.value.ownerId === "string" && parsed.value.ownerId ? parsed.value.ownerId : row.ownerId;
+    if (studentNo.length > 30 || /[\x01-\x1f]/.test(studentNo)) throw new Error("学号格式无效");
+    if (name.length > 20 || /[\x01-\x1f]/.test(name)) throw new Error("学生姓名格式无效");
+    // Check no duplicate student_no within same owner
+    if (studentNo !== row.studentNo || ownerId !== row.ownerId) {
+      const dup = sqlite.prepare("SELECT id FROM students WHERE owner_id = ? AND student_no = ? AND id != ?").get(ownerId, studentNo, studentId);
+      if (dup) throw new Error("新学号在该教师下已存在");
+    }
+    sqlite.prepare("UPDATE students SET owner_id = ?, student_no = ?, name = ?, updated_at = ? WHERE id = ?").run(ownerId, studentNo, name, now(), studentId);
+    const updated = sqlite.prepare("SELECT id, owner_id AS ownerId, student_no AS studentNo, name FROM students WHERE id = ?").get(studentId);
+    return Response.json({ student: updated });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "无法创建学生" }, { status: 400 });
+    return Response.json({ error: error instanceof Error ? error.message : "更新学生失败" }, { status: 400 });
   }
 }
 
-export async function DELETE(request: Request, context: { params: Promise<{ studentId: string }> }) {
+export async function DELETE(request: Request, context: Context) {
   await ensureDatabase();
   const session = requireAdminSession(request);
   if (!session) return adminForbidden();
