@@ -1,6 +1,6 @@
 # 拣题 · 智能组卷系统
 
-一套面向中学教师的本地部署题库与组卷系统。教师上传 PDF/Word 试卷，系统自动抽题入题库，人工或 AI 随机组卷，一键导出 Word / PDF / LaTeX。同时提供学生端练习考试、错题本、学习分析、学校模式作业批改。
+一套面向 **K12 全学段**（小学 / 初中 / 高中）教师的本地部署题库与组卷系统。教师上传 PDF/Word 试卷，系统自动抽题入题库，人工或 AI 随机组卷，一键导出 Word / PDF / LaTeX。同时提供学生端练习考试、错题本、学习分析、学校模式作业批改。
 
 > **GitHub**: https://github.com/wxgoo/jianti-exam-system
 > **Docker 镜像**: `ghcr.io/wxgoo/jianti-exam-system:latest` (public)

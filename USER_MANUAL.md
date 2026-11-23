@@ -216,17 +216,21 @@ scripts/start-local.bat
 .\scripts\start-local.bat
 ```
 
-脚本会：
-1. 加载 `.env` 环境变量（仅当前窗口）
-2. 激活 Python 虚拟环境 `.venv`（如存在）
-3. 启动 Node.js 全栈服务（Web 3050 / API 3051）
+脚本会自动完成：
+1. 检查 Node.js 版本
+2. **清理残留实例**（PID 文件 + 端口 3050/3051 扫描 + 进程名匹配，三重保障）
+3. 缺 `node_modules` 时自动 `npm ci`
+4. 缺 `.next\BUILD_ID` 时自动 `npm run build`
+5. 加载 `.env` 环境变量（仅当前窗口）
+6. 启动 Node.js 全栈服务（Web 3050 / API 3051）
+7. 所有退出路径都 **pause**，不会闪退——双击后窗口不会瞬间消失
 
 启动成功后会显示：
 ```
 [local] ready http://localhost:3050 (NestJS + independent worker)
 ```
 
-完整部署（含安装、构建、后台启动与健康检查）见 [11.1](#111-windows-一键部署)（`deploy-windows.bat`）。
+**注意**：这是前台启动，关闭窗口即停止服务。想要后台常驻（关窗口继续跑）用根目录 `deploy-windows.bat`（一键部署）或装成 NSSM 服务（见 11.1.2）。
 
 ### 5.2 手动启动
 
@@ -250,9 +254,8 @@ node scripts/run-local.mjs --web-port=3050 --api-port=3051
 
 ### 5.3 停止服务
 
-- 按 `Ctrl+C` 停止启动脚本，会自动清理子进程
-- 或双击 `关闭题库.cmd` 停止服务
-- 或执行：`node scripts/stop-local.mjs`
+- 按 `Ctrl+C` 停止前台启动脚本，会自动清理子进程
+- 执行：`node scripts/stop-local.mjs`（停止后台运行的服务）
 
 ---
 
@@ -738,13 +741,18 @@ taskkill /F /IM node.exe
 - `server/` 下导入不带扩展名
 - 代理路由使用 `@/lib/backend-client` 绝对路径
 
-### 9.6 不要使用旧的 `启动题库.cmd`
+### 9.6 旧版启动脚本的历史问题（已清理）
 
-**现象**：双击 `启动题库.cmd` 提示 `Node.js 22.22.0 is required`，或强制要求安装指定 Node 版本。
+**现象**：早期有用户报告双击 `启动题库.cmd` 提示 `Node.js 22.22.0 is required` 或强制要求安装特定 Node 版本。
 
-**原因**：旧脚本硬编码了 Node 22.22.0 版本检查，与本项目要求的 Node v26.x 不兼容。
+**原因**：早期手写的批处理脚本硬编码了 Node 版本检查，与本项目实际要求的 Node ≥ 22.13.0 不一致。旧脚本已于本次文档/代码整理中全部删除。
 
-**解决**：**不要使用** `启动题库.cmd`，请使用 `scripts/start-local.bat`（或 `node scripts/run-local.mjs`）启动系统。`关闭题库.cmd` 可以保留用于停止服务。
+**解决**：请使用以下任一方式启动系统：
+- 双击项目根目录 `deploy-windows.bat`（一键：安装 + 构建 + 后台启动，带健康检查）
+- 双击 `scripts/start-local.bat`（前台启动，需保持窗口打开）
+- 或命令行：`node scripts/run-local.mjs`
+
+停止服务：`node scripts/stop-local.mjs`
 
 ### 9.7 LaTeX 导出中文乱码
 

@@ -1,67 +1,98 @@
 @echo off
 rem ================================================================
-rem jianti-exam-system 一键启动脚本（Windows）
-rem - 设置环境变量（不污染系统，仅当前窗口生效）
-rem - 激活 Python venv 虚拟环境（如存在）
-rem - 启动 Node.js 全栈服务（Web 3050 / API 3051）
+rem jianti-exam-system - front-local launch (Windows)
+rem   - kills previous instance first (PID file + port scan)
+rem   - auto npm ci / npm run build if needed
+rem   - foreground: keep this window open to keep service alive
+rem All text is ASCII to avoid codepage 936 issues.
 rem ================================================================
 
 setlocal enabledelayedexpansion
 
 echo.
 echo ========================================
-echo   jianti-exam-system 启动脚本
+echo   jianti-exam-system launcher (foreground)
 echo ========================================
 echo.
 
-rem ---- 1. 切换到脚本所在目录的上一级（项目根目录）-----
+rem ---- 1. cd to repo root ----
 cd /d "%~dp0.."
-echo [INFO] 工作目录: %CD%
+echo [INFO] Working dir: %CD%
 
-rem ---- 2. 检查 Node.js 是否可用 ----
+rem ---- 2. check Node ----
 where node >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] 未找到 node.exe，请先安装 Node.js (https://nodejs.org/)
-    pause
-    exit /b 1
+    echo [ERROR] node.exe not found. Install from https://nodejs.org/
+    goto :fail
 )
 for /f "delims=" %%V in ('node -v 2^>nul') do set "NODE_VER=%%V"
-echo [INFO] Node.js 版本: %NODE_VER%
+echo [INFO] Node.js: %NODE_VER%
 
-rem ---- 3. 加载 .env 环境变量（仅当前窗口，不写入系统）-----
+rem ---- 3. kill old instance ----
+echo [INFO] Cleaning previous instance ...
+if exist ".runtime\local-3050.json" (
+    node scripts/stop-local.mjs 2>nul
+    timeout /t 2 /nobreak >nul
+)
+for %%P in (3050 3051) do (
+    for /f "tokens=5" %%T in ('netstat -ano 2^>nul ^| findstr "LISTENING" ^| findstr ":%%P"') do (
+        taskkill /PID %%T /F 2>nul
+    )
+)
+timeout /t 2 /nobreak >nul
+echo [INFO] Cleanup done.
+
+rem ---- 4. npm ci if needed ----
+if not exist "node_modules" (
+    echo [INFO] node_modules missing, npm ci ...
+    call npm.cmd ci --omit=dev
+    if errorlevel 1 goto :fail
+)
+
+rem ---- 5. build if needed ----
+if not exist ".next\BUILD_ID" (
+    echo [INFO] .next missing, npm run build ...
+    call npm.cmd run build
+    if errorlevel 1 goto :fail
+    echo [INFO] Build done.
+)
+
+rem ---- 6. load .env ----
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%a in (".env") do (
-        echo.%%a | findstr /i "^#" >nul && goto :nextline
-        echo.%%a | findstr /r "^[[:space:]]*$" >nul && goto :nextline
+        echo.%%a | findstr /i "^#" >nul && goto :envnext
+        echo.%%a | findstr /r "^[[:space:]]*$" >nul && goto :envnext
         set "%%a=%%b"
     )
-    :nextline
-)
-echo [env] 已加载 .env 环境变量（当前窗口有效）
-
-rem ---- 4. 激活 Python venv（若存在，避免污染系统 Python）-----
-if exist ".venv\Scripts\activate.bat" (
-    call ".venv\Scripts\activate.bat"
-    echo [venv] 已激活 Python 虚拟环境: .venv
-) else (
-    echo [venv] 未找到 .venv，将使用系统 Python（如需隔离请先运行 build.py 创建）
+    :envnext
 )
 
-rem ---- 5. 启动全栈服务 ----
+rem ---- 7. start (foreground) ----
 echo.
-echo [start] 启动 jianti-exam-system (Web http://localhost:3050 / API http://127.0.0.1:3051)
-echo [INFO] 请保持此窗口打开，关闭窗口即可停止服务。
+echo ========================================
+echo   Starting ... KEEP THIS WINDOW OPEN
+echo   Close this window = stop service
+echo   Web: http://127.0.0.1:3050
+echo   API: http://127.0.0.1:3051
+echo ========================================
 echo.
 
 node scripts/run-local.mjs
-if errorlevel 1 (
-    echo.
-    echo [ERROR] 服务启动失败，请查看上面的错误信息。
-    pause
-    exit /b 1
-)
+set "EXITCODE=%ERRORLEVEL%"
 
 echo.
-echo [INFO] 服务已停止。
+echo ========================================
+echo   Service exited (code = %EXITCODE%)
+echo ========================================
+echo.
 pause
-exit /b 0
+exit /b %EXITCODE%
+
+:fail
+echo.
+echo ========================================
+echo   FAILED - see messages above
+echo ========================================
+echo.
+pause
+exit /b 1
