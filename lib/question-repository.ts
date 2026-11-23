@@ -1,0 +1,584 @@
+import { documentScopeSql, documentStageSql, type EducationScope } from "./education-scope";
+import "server-only";
+import { selectDocumentWindow, type DocumentListOptions, type DocumentListResult } from "./document-list";
+
+import { getSqlite } from "../db";
+import { ensureDatabase } from "../db/bootstrap";
+import { requestTeacherSession } from "./server";
+import { contentTypeForKey, getFile } from "./file-storage";
+import type {
+  BoundingBox,
+  Question,
+  QuestionAsset,
+  QuestionType,
+  QuestionWithSource,
+  ReviewDocument,
+  ReviewPage,
+  SourceDocument,
+  VariationReview,
+} from "./types";
+
+type QuestionRow = {
+  id: string;
+  documentId: string;
+  number: string;
+  type: string;
+  stem: string;
+  optionsJson: string | null;
+  answer: string;
+  analysis: string;
+  pageNumber: number;
+  bboxJson: string;
+  status: string;
+  needsHumanReview: number | null;
+  missingImagesJson: string;
+  extractionIssuesJson: string;
+  aiReviewJson: string | null;
+  confidence: number;
+  folderId: string | null;
+  parentQuestionId: string | null;
+  parentExternalId: string | null;
+  variationKind: string | null;
+  variationReviewStatus: string | null;
+  variationReviewJson: string | null;
+  documentName: string;
+  sourceKind: string;
+  subject: string | null;
+  grade: string | null;
+  sourceYear: number | null;
+  sourceExamType: string | null;
+  sourceRegion: string | null;
+  sourceTextbook: string | null;
+  sourceSchool: string | null;
+  sourceRemovedAt: string | null;
+};
+
+type AssetRow = {
+  id: string;
+  questionId: string;
+  kind: string;
+  role: string;
+  label: string;
+  sourceKey: string | null;
+  cropKey: string | null;
+  bboxJson: string;
+  pageNumber: number | null;
+  pageStorageKey: string | null;
+  pageWidth: number | null;
+  pageHeight: number | null;
+};
+
+type RegionRow = {
+  questionId: string;
+  page: number;
+  bboxJson: string;
+};
+
+function fileUrl(key: string | null | undefined) {
+  if (!key) return null;
+  return "/api/files/" + key.split("/").map(encodeURIComponent).join("/");
+}
+
+function parseJson<T>(value: string | null, fallback: T): T {
+  if (!value) return fallback;
+  try { return JSON.parse(value) as T; } catch { return fallback; }
+}
+
+function placeholders(count: number) {
+  return Array.from({ length: count }, () => "?").join(",");
+}
+
+async function hydrateQuestions(rows: QuestionRow[]): Promise<QuestionWithSource[]> {
+  if (!rows.length) return [];
+  const sqlite = getSqlite();
+  const ids = rows.map((row) => row.id);
+  const assets = sqlite.prepare(
+    `SELECT a.id, a.question_id AS questionId, a.kind, a.role, a.label, a.source_key AS sourceKey,
+            a.crop_key AS cropKey, a.bbox_json AS bboxJson, p.page_number AS pageNumber,
+            p.storage_key AS pageStorageKey, p.width AS pageWidth, p.height AS pageHeight
+       FROM question_assets a
+       LEFT JOIN pages p ON p.id = a.page_id
+      WHERE a.question_id IN (${placeholders(ids.length)})
+      ORDER BY a.position, a.created_at, a.id`,
+  ).all(...ids) as AssetRow[];
+  const regions = sqlite.prepare(
+    `SELECT question_id AS questionId, page_number AS page, bbox_json AS bboxJson
+       FROM question_regions
+      WHERE question_id IN (${placeholders(ids.length)})
+      ORDER BY position, page_number`,
+  ).all(...ids) as RegionRow[];
+  const tagRows = sqlite.prepare(
+    `SELECT qt.question_id AS questionId, t.name
+       FROM question_tags qt JOIN tags t ON t.id = qt.tag_id
+      WHERE qt.question_id IN (${placeholders(ids.length)})
+      ORDER BY t.name`,
+  ).all(...ids) as Array<{ questionId: string; name: string }>;
+
+  return rows.map((row) => {
+    const questionAssets: QuestionAsset[] = assets.filter((asset) => asset.questionId === row.id).map((asset) => {
+      const bbox = parseJson<BoundingBox>(asset.bboxJson, { x: 0, y: 0, width: 10, height: 10 });
+      return {
+        id: asset.id,
+        kind: (["figure", "table", "graph"].includes(asset.kind) ? asset.kind : "figure") as QuestionAsset["kind"],
+        role: asset.role === "answer" ? "answer" : "question",
+        page: asset.pageNumber ?? row.pageNumber,
+        bbox,
+        label: asset.label,
+        sourceKey: asset.sourceKey ?? asset.pageStorageKey,
+        cropKey: asset.cropKey,
+        url: fileUrl(asset.cropKey),
+        width: asset.pageWidth ? Math.max(1, Math.round(asset.pageWidth * bbox.width / 100)) : undefined,
+        height: asset.pageHeight ? Math.max(1, Math.round(asset.pageHeight * bbox.height / 100)) : undefined,
+      };
+    });
+    const questionRegions = regions.filter((region) => region.questionId === row.id).map((region) => ({
+      page: region.page,
+      bbox: parseJson<BoundingBox>(region.bboxJson, { x: 0, y: 0, width: 10, height: 10 }),
+    }));
+    const legacyBox = parseJson<BoundingBox>(row.bboxJson, { x: 0, y: 0, width: 10, height: 10 });
+    return {
+      id: row.id,
+      number: row.number,
+      type: (["single", "multiple", "fill", "answer"].includes(row.type) ? row.type : "answer") as QuestionType,
+      stem: row.stem,
+      options: parseJson<Question["options"]>(row.optionsJson, []),
+      answer: row.answer,
+      analysis: row.analysis,
+      page: row.pageNumber,
+      bbox: legacyBox,
+      regions: questionRegions,
+      assets: questionAssets,
+      tags: tagRows.filter((tag) => tag.questionId === row.id).map((tag) => tag.name),
+      folderId: row.folderId,
+      parentQuestionId: row.parentQuestionId,
+      parentExternalId: row.parentExternalId,
+      variationKind: row.variationKind,
+      variationReview: parseJson<VariationReview | null>(row.variationReviewJson, null),
+      confidence: row.confidence,
+      needsHumanReview: row.needsHumanReview !== 0,
+      extractionIssues: parseJson(row.extractionIssuesJson, []),
+      aiReview: parseJson<Question["aiReview"]>(row.aiReviewJson, null),
+      missingImages: parseJson(row.missingImagesJson, []),
+      status: row.status === "approved"
+        ? "approved"
+        : row.needsHumanReview !== 0
+          ? "needs_attention"
+          : "pending",
+      source: {
+        documentId: row.documentId,
+        documentName: row.documentName,
+        subject: row.subject ?? "未设置学科",
+        grade: row.grade ?? "未设置年级",
+        year: row.sourceYear,
+        examType: row.sourceExamType,
+        region: row.sourceRegion,
+        textbook: row.sourceTextbook,
+        school: row.sourceSchool,
+        sourceRemoved: Boolean(row.sourceRemovedAt),
+        origin: row.sourceKind === "imported"
+          ? "imported"
+          : row.sourceKind === "generated"
+            ? "generated"
+            : "original",
+      },
+    };
+  });
+}
+
+const questionSelect = `
+  SELECT q.id, q.document_id AS documentId, q.number, q.type, q.stem,
+         q.options_json AS optionsJson, q.answer, q.analysis, q.page_number AS pageNumber,
+         q.bbox_json AS bboxJson, q.status, q.needs_human_review AS needsHumanReview, q.confidence,
+         q.missing_images_json AS missingImagesJson,
+         q.extraction_issues_json AS extractionIssuesJson,
+         q.ai_review_json AS aiReviewJson,
+         q.folder_id AS folderId, q.parent_question_id AS parentQuestionId, q.parent_external_id AS parentExternalId, q.variation_kind AS variationKind,
+         q.variation_review_status AS variationReviewStatus, q.variation_review_json AS variationReviewJson,
+         d.name AS documentName, d.source_kind AS sourceKind, d.subject, d.grade, d.source_year AS sourceYear,
+         d.source_exam_type AS sourceExamType, d.source_region AS sourceRegion,
+         d.source_textbook AS sourceTextbook, d.source_school AS sourceSchool, d.source_removed_at AS sourceRemovedAt
+    FROM questions q JOIN documents d ON d.id = q.document_id`;
+
+export async function getReviewData(documentId: string, ownerId: string) {
+  await ensureDatabase();
+  const sqlite = getSqlite();
+  const documentRow = sqlite.prepare(
+    `SELECT d.id, d.name, d.subject, d.grade, d.source_year AS year,
+            d.source_exam_type AS examType, d.source_region AS region, d.source_textbook AS textbook, d.source_school AS school,
+            d.status, d.error, d.page_count AS pageCount,
+            j.status AS jobStatus, j.next_attempt_at AS nextAttemptAt,
+            j.question_total AS recognitionQuestionTotal,
+            j.completed_question_numbers_json AS recognizedQuestionNumbersJson,
+            j.stream_phase AS recognitionPhase, j.last_stream_event_at AS recognitionLastEventAt,
+            j.stream_message AS recognitionMessage,
+            j.profile_id AS modelProfileId,
+            COALESCE(mp.display_name, (SELECT NULLIF(rm.model, 'pending') FROM extraction_runs rm WHERE rm.document_id = d.id AND rm.model <> 'pending' ORDER BY rm.created_at DESC LIMIT 1)) AS modelDisplayName,
+            COALESCE(mp.model, (SELECT NULLIF(rm.model, 'pending') FROM extraction_runs rm WHERE rm.document_id = d.id AND rm.model <> 'pending' ORDER BY rm.created_at DESC LIMIT 1)) AS modelName,
+            COALESCE(mp.provider, (SELECT rm.provider FROM extraction_runs rm WHERE rm.document_id = d.id AND rm.model <> 'pending' ORDER BY rm.created_at DESC LIMIT 1)) AS modelProvider,
+            COUNT(q.id) AS questionCount,
+            COALESCE(SUM(CASE WHEN q.status = 'approved' THEN 1 ELSE 0 END), 0) AS approvedCount
+       FROM documents d LEFT JOIN questions q ON q.document_id = d.id
+       LEFT JOIN document_jobs j ON j.document_id = d.id
+       LEFT JOIN model_profiles mp ON mp.id = j.profile_id AND mp.owner_id = d.owner_id
+      WHERE d.id = ? AND d.owner_id = ? AND d.source_removed_at IS NULL GROUP BY d.id`,
+  ).get(documentId, ownerId) as (Omit<ReviewDocument, "subject" | "grade"> & { subject: string | null; grade: string | null }) | undefined;
+  if (!documentRow) return null;
+  const pages = sqlite.prepare(
+    `SELECT p.id, p.page_number AS pageNumber, p.storage_key AS storageKey, p.width, p.height,
+            COALESCE(r.status, 'queued') AS extractionStatus, COALESCE(r.attempt, 0) AS extractionAttempt,
+            r.error AS extractionError, r.next_attempt_at AS nextAttemptAt,
+            COALESCE(rmp.display_name, NULLIF(r.model, 'pending')) AS modelDisplayName,
+            NULLIF(r.model, 'pending') AS modelName, r.provider AS modelProvider
+       FROM pages p LEFT JOIN extraction_runs r
+         ON r.id = (
+           SELECT latest.id FROM extraction_runs latest
+            WHERE latest.document_id = p.document_id AND latest.page_number = p.page_number
+            ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1
+         )
+       LEFT JOIN model_profiles rmp ON rmp.id = r.model_profile_id
+      WHERE p.document_id = ? ORDER BY p.page_number`,
+  ).all(documentId) as Array<{
+    id: string; pageNumber: number; storageKey: string; width: number; height: number;
+    extractionStatus: ReviewPage["extractionStatus"]; extractionAttempt: number; extractionError: string | null; nextAttemptAt: string | null;
+    modelDisplayName: string | null; modelName: string | null; modelProvider: string | null;
+  }>;
+  const questionRows = sqlite.prepare(
+    `${questionSelect} WHERE d.id = ? AND d.owner_id = ?
+      ORDER BY q.page_number, CAST(q.number AS INTEGER), q.number, q.created_at`,
+  ).all(documentId, ownerId) as QuestionRow[];
+  const reviewPages = pages.map((page): ReviewPage => ({
+      id: page.id,
+      pageNumber: page.pageNumber,
+      imageUrl: fileUrl(page.storageKey)!,
+      width: page.width,
+      height: page.height,
+      extractionStatus: page.extractionStatus,
+      extractionAttempt: page.extractionAttempt,
+      extractionError: page.extractionError,
+      nextAttemptAt: page.nextAttemptAt,
+      modelDisplayName: page.modelDisplayName,
+      modelName: page.modelName,
+      modelProvider: page.modelProvider,
+    }));
+  return {
+    document: {
+      ...documentRow,
+      subject: documentRow.subject ?? "未设置学科",
+      grade: documentRow.grade ?? "未设置年级",
+      completedPageCount: reviewPages.filter((page) => page.extractionStatus === "complete").length,
+      failedPageCount: reviewPages.filter((page) => page.extractionStatus === "failed").length,
+    } satisfies ReviewDocument,
+    pages: reviewPages,
+    questions: await hydrateQuestions(questionRows),
+  };
+}
+
+export async function getApprovedQuestions(ownerId: string, ids?: string[], scope?: EducationScope, school?: string, subject?: string) {
+  if (ids && !ids.length) return [];
+  await ensureDatabase();
+  const sqlite = getSqlite();
+
+  // 多租户：同一学校同一学科的教师共享已审核题库
+  // 如果提供了 school 和 subject，则可见：自己的已审核题目 + 同校同科其他老师的已审核题目
+  // 否则仅可见自己的已审核题目（向后兼容）
+  let ownerClause: string;
+  let ownerParams: unknown[];
+  if (school && subject) {
+    ownerClause = `(d.owner_id = ? OR (d.school = ? AND d.subject = ?))`;
+    ownerParams = [ownerId, school, subject];
+  } else {
+    ownerClause = `d.owner_id = ?`;
+    ownerParams = [ownerId];
+  }
+
+  const idClause = ids?.length ? ` AND q.id IN (${placeholders(ids.length)})` : "";
+  const filter = documentScopeSql(scope);
+  const params = [...ownerParams, ...filter.params, ...(ids ?? [])];
+  const rows = sqlite.prepare(
+    `${questionSelect} WHERE q.status = 'approved' AND ${ownerClause}${filter.sql}${idClause}
+      ORDER BY d.created_at DESC, q.page_number, CAST(q.number AS INTEGER), q.number LIMIT 2000`,
+  ).all(...params) as QuestionRow[];
+  const hydrated = await hydrateQuestions(rows);
+  if (!ids?.length) return hydrated;
+  const order = new Map(ids.map((id, index) => [id, index]));
+  return hydrated.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+}
+
+export type QuestionSearchOptions = {
+  sourceKind?: string;
+  query?: string;
+  type?: string;
+  tag?: string;
+  documentId?: string;
+  subject?: string;
+  grade?: string;
+  stage?: string;
+  year?: number;
+  examType?: string;
+  region?: string;
+  /** 文档来源学校（筛选用） */
+  school?: string;
+  textbook?: string;
+  folderId?: string;
+  page?: number;
+  pageSize?: number;
+  /** 题库共享：教师所属学校，与 subject 一起用于共享已审核题库 */
+  sharedSchool?: string;
+  /** 题库共享：教师所属学科，与 sharedSchool 一起用于共享已审核题库 */
+  sharedSubject?: string;
+};
+
+function likePattern(value: string) {
+  return `%${value.replace(/([%_\\])/g, "\\$1")}%`;
+}
+
+export async function searchApprovedQuestions(ownerId: string, options: QuestionSearchOptions = {}) {
+  await ensureDatabase();
+  const sqlite = getSqlite();
+
+  // 多租户题库共享：同一学校的教师共享已审核题目（不管学科）
+  // sharedSchool 是教师所属学校，用于决定可见范围
+  // sharedSubject 是学科筛选条件，独立于学校共享逻辑
+  let ownerClause: string;
+  let ownerParams: (string | number)[];
+  if (options.sharedSchool) {
+    ownerClause = `(d.owner_id = ? OR d.school = ?)`;
+    ownerParams = [ownerId, options.sharedSchool];
+  } else {
+    ownerClause = `d.owner_id = ?`;
+    ownerParams = [ownerId];
+  }
+
+  const clauses = [ownerClause, "q.status = 'approved'"];
+  const params: (string | number)[] = [...ownerParams];
+  if (options.type && ["single", "multiple", "fill", "answer"].includes(options.type)) {
+    clauses.push("q.type = ?"); params.push(options.type);
+  }
+  if (options.sourceKind && ["uploaded", "imported", "generated"].includes(options.sourceKind)) { clauses.push("d.source_kind = ?"); params.push(options.sourceKind); }
+  if (options.documentId) { clauses.push("d.id = ?"); params.push(options.documentId); }
+  if (options.subject) { clauses.push("COALESCE(NULLIF(d.subject, ''), '数学') = ?"); params.push(options.subject); }
+  if (options.grade) { clauses.push("d.grade = ?"); params.push(options.grade); }
+  if (options.stage) { clauses.push(`(${documentStageSql()}) = ?`); params.push(options.stage); }
+  if (options.year) { clauses.push("d.source_year = ?"); params.push(options.year); }
+  if (options.examType) { clauses.push("d.source_exam_type = ?"); params.push(options.examType); }
+  if (options.region) { clauses.push("d.source_region = ?"); params.push(options.region); }
+  if (options.school) { clauses.push("d.source_school = ?"); params.push(options.school); }
+  if (options.textbook) { clauses.push("d.source_textbook = ?"); params.push(options.textbook); }
+  if (options.folderId === "unfiled") clauses.push("q.folder_id IS NULL");
+  else if (options.folderId) { clauses.push("q.folder_id = ?"); params.push(options.folderId); }
+  if (options.tag) {
+    clauses.push("EXISTS (SELECT 1 FROM question_tags sqt JOIN tags st ON st.id = sqt.tag_id WHERE sqt.question_id = q.id AND st.name = ?)");
+    params.push(options.tag);
+  }
+  const query = options.query?.trim();
+  if (query) {
+    const pattern = likePattern(query);
+    clauses.push(`(
+      q.stem LIKE ? ESCAPE '\\' OR q.answer LIKE ? ESCAPE '\\' OR q.analysis LIKE ? ESCAPE '\\'
+      OR d.name LIKE ? ESCAPE '\\' OR COALESCE(d.subject, '') LIKE ? ESCAPE '\\'
+      OR COALESCE(d.grade, '') LIKE ? ESCAPE '\\' OR COALESCE(d.source_exam_type, '') LIKE ? ESCAPE '\\'
+      OR COALESCE(d.source_region, '') LIKE ? ESCAPE '\\' OR COALESCE(d.source_school, '') LIKE ? ESCAPE '\\'
+      OR COALESCE(d.source_textbook, '') LIKE ? ESCAPE '\\'
+      OR EXISTS (SELECT 1 FROM question_tags qqt JOIN tags tt ON tt.id = qqt.tag_id WHERE qqt.question_id = q.id AND tt.name LIKE ? ESCAPE '\\')
+    )`);
+    params.push(...Array.from({ length: 11 }, () => pattern));
+  }
+  const where = clauses.join(" AND ");
+  const pageSize = Math.max(1, Math.min(100, Math.floor(options.pageSize ?? 30)));
+  const page = Math.max(1, Math.floor(options.page ?? 1));
+  const total = (sqlite.prepare(
+    `SELECT COUNT(*) AS total FROM questions q JOIN documents d ON d.id = q.document_id WHERE ${where}`,
+  ).get(...params) as { total: number }).total;
+  const rows = sqlite.prepare(
+    `${questionSelect} WHERE ${where}
+      ORDER BY d.created_at DESC, q.page_number, CAST(q.number AS INTEGER), q.number
+      LIMIT ? OFFSET ?`,
+  ).all(...params, pageSize, (page - 1) * pageSize) as QuestionRow[];
+  return {
+    questions: await hydrateQuestions(rows),
+    pagination: { page, pageSize, total, pageCount: Math.max(1, Math.ceil(total / pageSize)) },
+  };
+}
+
+export async function getBankData(ownerId: string, scope?: EducationScope, sharedSchool?: string, sharedSubject?: string) {
+  const result = await searchApprovedQuestions(ownerId, { pageSize: 30, ...scope, sharedSchool, sharedSubject });
+  const sqlite = getSqlite();
+  const filter = documentScopeSql(scope);
+  const params = [ownerId, ...filter.params];
+  const stats = sqlite.prepare(
+    `SELECT COUNT(q.id) AS total,
+            COALESCE(SUM(CASE WHEN q.status = 'approved' THEN 1 ELSE 0 END), 0) AS approved,
+            COALESCE(SUM(CASE WHEN q.status = 'approved' AND EXISTS (SELECT 1 FROM question_assets a WHERE a.question_id = q.id) THEN 1 ELSE 0 END), 0) AS withAssets,
+            0 AS papers
+       FROM questions q JOIN documents d ON d.id = q.document_id WHERE d.owner_id = ?${filter.sql}`,
+  ).get(...params) as { total: number; approved: number; withAssets: number; papers: number };
+  stats.papers = (sqlite.prepare(`SELECT COUNT(*) AS count FROM papers
+    WHERE owner_id = ?${scope ? " AND json_extract(settings_json, '$.subject') = ? AND json_extract(settings_json, '$.stage') = ?" : ""}`)
+    .get(...params) as { count: number }).count;
+  const tags = sqlite.prepare(
+    `SELECT DISTINCT t.name FROM tags t JOIN question_tags qt ON qt.tag_id = t.id
+      JOIN questions q ON q.id = qt.question_id JOIN documents d ON d.id = q.document_id
+      WHERE d.owner_id = ?${filter.sql} AND q.status = 'approved' ORDER BY t.name`,
+  ).all(...params) as Array<{ name: string }>;
+  const sources = sqlite.prepare(
+    `SELECT DISTINCT d.id, d.name, d.source_year AS year, d.source_exam_type AS examType,
+            d.source_region AS region, d.source_textbook AS textbook, d.source_school AS school
+       FROM documents d JOIN questions q ON q.document_id = d.id
+      WHERE d.owner_id = ?${filter.sql} AND q.status = 'approved' ORDER BY d.created_at DESC`,
+  ).all(...params) as Array<{ id: string; name: string; year: number | null; examType: string | null; region: string | null; textbook: string | null; school: string | null }>;
+  const folders = sqlite.prepare(
+    `SELECT f.id, f.parent_id AS parentId, f.name, f.created_at AS createdAt, f.updated_at AS updatedAt,
+            COUNT(CASE WHEN d.id IS NOT NULL AND q.status = 'approved' THEN q.id END) AS questionCount
+       FROM question_folders f
+       LEFT JOIN questions q ON q.folder_id = f.id
+       LEFT JOIN documents d ON d.id = q.document_id AND d.owner_id = f.owner_id${filter.sql}
+      WHERE f.owner_id = ?${scope ? ' AND f.subject = ? AND f.stage = ?' : ''} GROUP BY f.id ORDER BY f.name COLLATE NOCASE`,
+  ).all(...filter.params, ...params) as Array<{ id: string; parentId: string | null; name: string; questionCount: number; createdAt: string; updatedAt: string }>;
+  const facets = {
+    grades: sqlite.prepare(
+      `SELECT COALESCE(d.grade, '未设置年级') AS value, COUNT(q.id) AS count
+         FROM questions q JOIN documents d ON d.id = q.document_id
+        WHERE d.owner_id = ?${filter.sql} AND q.status = 'approved' GROUP BY d.grade ORDER BY value`,
+    ).all(...params) as Array<{ value: string; count: number }>,
+    regions: sqlite.prepare(
+      `SELECT COALESCE(NULLIF(d.source_region, ''), '未设置地区') AS value, COUNT(q.id) AS count
+         FROM questions q JOIN documents d ON d.id = q.document_id
+        WHERE d.owner_id = ?${filter.sql} AND q.status = 'approved' GROUP BY d.source_region ORDER BY count DESC, value LIMIT 40`,
+    ).all(...params) as Array<{ value: string; count: number }>,
+    textbooks: sqlite.prepare(
+      `SELECT COALESCE(NULLIF(d.source_textbook, ''), '未设置教材') AS value, COUNT(q.id) AS count
+         FROM questions q JOIN documents d ON d.id = q.document_id
+        WHERE d.owner_id = ?${filter.sql} AND q.status = 'approved' GROUP BY d.source_textbook ORDER BY count DESC, value LIMIT 30`,
+    ).all(...params) as Array<{ value: string; count: number }>,
+  };
+  const profileRow = sqlite.prepare(
+    "SELECT preferred_region AS region, preferred_textbook AS textbook, preferred_grades_json AS gradesJson FROM app_settings WHERE owner_id = ?",
+  ).get(ownerId) as { region: string | null; textbook: string | null; gradesJson: string } | undefined;
+  return {
+    ...result,
+    stats,
+    tags: tags.map((tag) => tag.name),
+    sources,
+    folders,
+    facets,
+    profile: {
+      region: profileRow?.region ?? "全国",
+      textbook: profileRow?.textbook ?? "人教版",
+      grades: parseJson<string[]>(profileRow?.gradesJson ?? "[]", []),
+    },
+  };
+}
+
+export async function getDocuments(ownerId: string, documentIds?: string[], school?: string): Promise<SourceDocument[]> {
+  await ensureDatabase();
+  const ids = documentIds ?? selectDocumentWindow(getSqlite(), ownerId).ids;
+  if (!ids.length) return [];
+  const rows = getSqlite().prepare(
+    `SELECT d.id, d.name, COALESCE(d.subject, '未设置学科') AS subject,
+            COALESCE(d.grade, '未设置年级') AS grade, d.page_count AS pageCount,
+            d.status, d.created_at AS createdAt, COUNT(q.id) AS questionCount,
+            COALESCE(SUM(CASE WHEN q.status = 'approved' THEN 1 ELSE 0 END), 0) AS approvedCount,
+            (SELECT COUNT(DISTINCT r.page_number) FROM extraction_runs r WHERE r.document_id = d.id AND r.status = 'complete') AS completedPageCount,
+            (SELECT COUNT(DISTINCT r.page_number) FROM extraction_runs r WHERE r.document_id = d.id AND r.status = 'failed') AS failedPageCount,
+            (SELECT COUNT(DISTINCT r.page_number) FROM extraction_runs r WHERE r.document_id = d.id AND r.status = 'retry_wait') AS retryWaitPageCount,
+            j.status AS jobStatus, j.attempt AS jobAttempt,
+            j.next_attempt_at AS nextAttemptAt, j.last_error AS lastError,
+            j.question_total AS recognitionQuestionTotal,
+            COALESCE(json_array_length(j.completed_question_numbers_json), 0) AS recognizedQuestionCount,
+            j.ai_review_enabled AS aiReviewEnabled,
+            COALESCE(SUM(CASE WHEN json_valid(q.ai_review_json) AND
+              (j.document_id IS NULL OR EXISTS (SELECT 1 FROM json_each(j.completed_question_numbers_json) n WHERE n.value = q.number))
+              THEN CASE WHEN json_extract(q.ai_review_json, '$.status') IN ('passed', 'issues') THEN 1 ELSE 0 END ELSE 0 END), 0) AS aiReviewedQuestionCount,
+            COALESCE(SUM(CASE WHEN json_valid(q.ai_review_json) AND
+              (j.document_id IS NULL OR EXISTS (SELECT 1 FROM json_each(j.completed_question_numbers_json) n WHERE n.value = q.number))
+              THEN CASE WHEN json_extract(q.ai_review_json, '$.status') = 'failed' THEN 1 ELSE 0 END ELSE 0 END), 0) AS aiReviewFailedQuestionCount,
+            j.stream_phase AS recognitionPhase, j.stream_message AS recognitionMessage,
+            j.profile_id AS modelProfileId,
+            COALESCE(mp.display_name, (SELECT NULLIF(rm.model, 'pending') FROM extraction_runs rm WHERE rm.document_id = d.id AND rm.model <> 'pending' ORDER BY rm.created_at DESC LIMIT 1)) AS modelDisplayName,
+            COALESCE(mp.model, (SELECT NULLIF(rm.model, 'pending') FROM extraction_runs rm WHERE rm.document_id = d.id AND rm.model <> 'pending' ORDER BY rm.created_at DESC LIMIT 1)) AS modelName,
+            COALESCE(mp.provider, (SELECT rm.provider FROM extraction_runs rm WHERE rm.document_id = d.id AND rm.model <> 'pending' ORDER BY rm.created_at DESC LIMIT 1)) AS modelProvider
+       FROM documents d LEFT JOIN questions q ON q.document_id = d.id
+       LEFT JOIN document_jobs j ON j.document_id = d.id
+       LEFT JOIN model_profiles mp ON mp.id = j.profile_id AND mp.owner_id = d.owner_id
+      WHERE ${school ? "(d.owner_id = ? OR d.school = ?)" : "d.owner_id = ?"} AND d.source_removed_at IS NULL AND d.id IN (${ids.map(()=>"?").join(",")}) GROUP BY d.id`,
+  ).all(ownerId, ...(school ? [school] : []), ...ids) as SourceDocument[];
+  const order = new Map(ids.map((id,index)=>[id,index]));
+  return rows.sort((a,b)=>order.get(a.id)!-order.get(b.id)!).map(row => ({ ...row, aiReviewEnabled: Boolean(row.aiReviewEnabled) }));
+}
+
+export async function getDocumentPage(ownerId: string, options: DocumentListOptions = {}): Promise<DocumentListResult> {
+  await ensureDatabase();
+  const { ids, ...metadata } = selectDocumentWindow(getSqlite(), ownerId, options);
+  return { ...metadata, documents: await getDocuments(ownerId, ids, options.school) };
+}
+
+export type SavedPaper = {
+  id: string;
+  title: string;
+  subtitle: string;
+  settings: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  questions: QuestionWithSource[];
+};
+
+export async function getUploadedPaperData(documentId: string, ownerId: string) {
+  await ensureDatabase();
+  const sqlite = getSqlite();
+  const document = sqlite.prepare(
+    `SELECT id, name AS title, status, COALESCE(subject, '') AS subject, COALESCE(grade, '') AS grade
+       FROM documents WHERE id = ? AND owner_id = ? AND source_kind = 'uploaded'`,
+  ).get(documentId, ownerId) as { id: string; title: string; status: string; subject: string; grade: string } | undefined;
+  if (!document) return null;
+  // Read the saved recognition results, including retained questions after source-file deletion.
+  const rows = sqlite.prepare(
+    `${questionSelect} WHERE d.id = ? AND d.owner_id = ?
+      ORDER BY q.page_number, CAST(q.number AS INTEGER), q.number, q.created_at`,
+  ).all(documentId, ownerId) as QuestionRow[];
+  return { ...document, questions: await hydrateQuestions(rows) };
+}
+
+export async function getPaperData(paperId: string, ownerId: string): Promise<SavedPaper | null> {
+  await ensureDatabase();
+  const sqlite = getSqlite();
+  const paper = sqlite.prepare(
+    `SELECT id, title, COALESCE(subtitle, '') AS subtitle, settings_json AS settingsJson,
+            created_at AS createdAt, updated_at AS updatedAt
+       FROM papers WHERE id = ? AND owner_id = ?`,
+  ).get(paperId, ownerId) as { id: string; title: string; subtitle: string; settingsJson: string; createdAt: string; updatedAt: string } | undefined;
+  if (!paper) return null;
+  // Existing references remain visible if a question later returns to review.
+  // Saving still requires approval; do not silently drop such references.
+  const rows = sqlite.prepare(
+    `${questionSelect} JOIN paper_items pi ON pi.question_id = q.id
+      WHERE pi.paper_id = ? AND d.owner_id = ? ORDER BY pi.position`,
+  ).all(paperId, ownerId) as QuestionRow[];
+  const questions = await hydrateQuestions(rows);
+  return {
+    id: paper.id,
+    title: paper.title,
+    subtitle: paper.subtitle,
+    settings: parseJson<Record<string, unknown>>(paper.settingsJson, {}),
+    createdAt: paper.createdAt,
+    updatedAt: paper.updatedAt,
+    questions,
+  };
+}
+
+export async function getPaperPrintData(paperId: string, ownerId: string) {
+  const paper = await getPaperData(paperId, ownerId);
+  if (!paper) return null;
+  const questions = await Promise.all(paper.questions.map(async (question) => ({
+    ...question,
+    assets: await Promise.all(question.assets.map(async (asset) => {
+      if (!asset.cropKey) return asset;
+      try {
+        const bytes = await getFile(asset.cropKey);
+        return { ...asset, url: `data:${contentTypeForKey(asset.cropKey)};base64,${bytes.toString("base64")}` };
+      } catch {
+        return { ...asset, url: null };
+      }
+    })),
+  })));
+  return { ...paper, questions };
+}

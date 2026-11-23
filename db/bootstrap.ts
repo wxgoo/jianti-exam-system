@@ -1,0 +1,728 @@
+import { migrateEducationScopes } from "./education-scope-migration";
+import { teachingSkillSchemaSql } from "../lib/teaching-skill-store";
+import { getSqlite } from ".";
+import { createHash } from "node:crypto";
+import { runMigrations } from "./migrations";
+import {
+  installDatabaseInvariants,
+  repairApprovedQuestionReviewFlags,
+  repairFailedDocumentApprovals,
+} from "../lib/database-invariants";
+
+const schemaSql = `
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', name TEXT NOT NULL,
+  mime_type TEXT NOT NULL, original_key TEXT, status TEXT NOT NULL DEFAULT 'uploading', page_count INTEGER NOT NULL DEFAULT 0,
+  subject TEXT, grade TEXT, source_year INTEGER, source_exam_type TEXT, source_region TEXT, source_textbook TEXT, source_school TEXT,
+  checksum TEXT, error TEXT, source_removed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS documents_owner_created_idx ON documents(owner_id, created_at);
+CREATE INDEX IF NOT EXISTS documents_status_idx ON documents(status);
+CREATE TABLE IF NOT EXISTS pages (
+  id TEXT PRIMARY KEY NOT NULL, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  page_number INTEGER NOT NULL, storage_key TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ready', checksum TEXT, created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS pages_document_number_idx ON pages(document_id, page_number);
+CREATE TABLE IF NOT EXISTS extraction_runs (
+  id TEXT PRIMARY KEY NOT NULL, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  page_id TEXT REFERENCES pages(id) ON DELETE SET NULL, page_number INTEGER, model_profile_id TEXT,
+  provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
+  idempotency_key TEXT, raw_json TEXT, error TEXT, error_code TEXT, next_attempt_at TEXT,
+  lease_owner TEXT, lease_expires_at TEXT, created_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS runs_document_idx ON extraction_runs(document_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS runs_idempotency_idx ON extraction_runs(idempotency_key);
+CREATE TABLE IF NOT EXISTS question_folders (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', parent_id TEXT REFERENCES question_folders(id) ON DELETE RESTRICT,
+  name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS question_folders_owner_parent_idx ON question_folders(owner_id, parent_id);
+CREATE TABLE IF NOT EXISTS questions (
+  id TEXT PRIMARY KEY NOT NULL, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  number TEXT NOT NULL, type TEXT NOT NULL, stem TEXT NOT NULL, options_json TEXT, answer TEXT NOT NULL DEFAULT '',
+  analysis TEXT NOT NULL DEFAULT '', page_number INTEGER NOT NULL, bbox_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', needs_human_review INTEGER, confidence REAL NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0,
+  folder_id TEXT REFERENCES question_folders(id) ON DELETE SET NULL, parent_question_id TEXT, parent_external_id TEXT, variation_kind TEXT,
+  variation_review_status TEXT, variation_review_json TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS questions_document_page_idx ON questions(document_id, page_number);
+CREATE INDEX IF NOT EXISTS questions_type_status_idx ON questions(type, status);
+CREATE TABLE IF NOT EXISTS variation_runs (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo',
+  source_question_id TEXT REFERENCES questions(id) ON DELETE SET NULL, source_snapshot_hash TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL, quality_mode TEXT NOT NULL DEFAULT 'reviewed', requested_count INTEGER NOT NULL,
+  difficulty TEXT NOT NULL, focus TEXT NOT NULL DEFAULT '', instructions TEXT NOT NULL DEFAULT '',
+  generator_profile_id TEXT, reviewer_profile_id TEXT, status TEXT NOT NULL DEFAULT 'generating', result_json TEXT, error TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variation_runs_owner_idempotency_idx ON variation_runs(owner_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS variation_runs_owner_created_idx ON variation_runs(owner_id, created_at);
+CREATE INDEX IF NOT EXISTS variation_runs_source_idx ON variation_runs(source_question_id, created_at);
+CREATE TABLE IF NOT EXISTS variation_candidates (
+  id TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL REFERENCES variation_runs(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL, content_json TEXT NOT NULL, review_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'awaiting_teacher', promoted_question_id TEXT REFERENCES questions(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variation_candidates_run_ordinal_idx ON variation_candidates(run_id, ordinal);
+CREATE INDEX IF NOT EXISTS variation_candidates_run_status_idx ON variation_candidates(run_id, status);
+CREATE TABLE IF NOT EXISTS question_regions (
+  id TEXT PRIMARY KEY NOT NULL, question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+  page_id TEXT REFERENCES pages(id) ON DELETE SET NULL, page_number INTEGER NOT NULL,
+  bbox_json TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS question_regions_question_page_idx ON question_regions(question_id, page_number);
+CREATE INDEX IF NOT EXISTS question_regions_page_idx ON question_regions(page_id);
+CREATE TABLE IF NOT EXISTS question_assets (
+  id TEXT PRIMARY KEY NOT NULL, question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+  page_id TEXT REFERENCES pages(id) ON DELETE SET NULL, kind TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'question', label TEXT NOT NULL DEFAULT '题图',
+  source_key TEXT, crop_key TEXT, bbox_json TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS assets_question_idx ON question_assets(question_id);
+CREATE TABLE IF NOT EXISTS tags (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS tags_name_idx ON tags(name);
+CREATE TABLE IF NOT EXISTS tag_catalog (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', subject TEXT NOT NULL,
+  stage TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tag_catalog_scope_name_idx ON tag_catalog(owner_id, subject, stage, name);
+CREATE INDEX IF NOT EXISTS tag_catalog_scope_idx ON tag_catalog(owner_id, subject, stage);
+CREATE TABLE IF NOT EXISTS question_tags (
+  question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY(question_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS question_tags_tag_idx ON question_tags(tag_id);
+CREATE TABLE IF NOT EXISTS bank_imports (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', source_name TEXT NOT NULL,
+  package_id TEXT, question_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'processing',
+  error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS bank_imports_owner_created_idx ON bank_imports(owner_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS bank_imports_active_package_idx ON bank_imports(owner_id, package_id)
+  WHERE status IN ('processing', 'complete');
+CREATE TABLE IF NOT EXISTS paper_folders (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', parent_id TEXT REFERENCES paper_folders(id) ON DELETE RESTRICT,
+  name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS paper_folders_owner_parent_idx ON paper_folders(owner_id, parent_id);
+CREATE TABLE IF NOT EXISTS papers (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', title TEXT NOT NULL, subtitle TEXT,
+  folder_id TEXT REFERENCES paper_folders(id) ON DELETE SET NULL,
+  settings_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS papers_owner_created_idx ON papers(owner_id, created_at);
+CREATE TABLE IF NOT EXISTS paper_templates (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', name TEXT NOT NULL,
+  subject TEXT NOT NULL, stage TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'custom', description TEXT NOT NULL DEFAULT '',
+  config_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS paper_templates_owner_scope_idx ON paper_templates(owner_id, subject, stage);
+CREATE UNIQUE INDEX IF NOT EXISTS paper_templates_owner_name_idx ON paper_templates(owner_id, name);
+CREATE TABLE IF NOT EXISTS answer_imports (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo',
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE, source_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'processing', result_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS answer_imports_document_idx ON answer_imports(document_id, created_at);
+CREATE TABLE IF NOT EXISTS paper_items (
+  paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+  question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+  position INTEGER NOT NULL, score INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(paper_id, question_id)
+);
+CREATE INDEX IF NOT EXISTS paper_items_position_idx ON paper_items(paper_id, position);
+CREATE TABLE IF NOT EXISTS teaching_classes (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', name TEXT NOT NULL,
+  grade TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '数学', school_year TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS teaching_classes_owner_year_name_idx ON teaching_classes(owner_id, school_year, name);
+CREATE INDEX IF NOT EXISTS teaching_classes_owner_archived_idx ON teaching_classes(owner_id, archived, updated_at);
+CREATE TABLE IF NOT EXISTS students (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', student_no TEXT NOT NULL,
+  name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS students_owner_number_idx ON students(owner_id, student_no);
+CREATE INDEX IF NOT EXISTS students_owner_name_idx ON students(owner_id, name);
+CREATE TABLE IF NOT EXISTS class_students (
+  class_id TEXT NOT NULL REFERENCES teaching_classes(id) ON DELETE CASCADE,
+  student_id TEXT NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+  seat_number TEXT, joined_at TEXT NOT NULL, PRIMARY KEY(class_id, student_id)
+);
+CREATE INDEX IF NOT EXISTS class_students_student_idx ON class_students(student_id, class_id);
+CREATE TABLE IF NOT EXISTS assignments (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo',
+  paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE RESTRICT, title TEXT NOT NULL,
+  assignment_code TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', due_at TEXT,
+  total_score REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS assignments_code_idx ON assignments(assignment_code);
+CREATE INDEX IF NOT EXISTS assignments_owner_status_idx ON assignments(owner_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS assignments_paper_idx ON assignments(paper_id, created_at);
+CREATE TABLE IF NOT EXISTS assignment_classes (
+  assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+  class_id TEXT NOT NULL REFERENCES teaching_classes(id) ON DELETE RESTRICT,
+  PRIMARY KEY(assignment_id, class_id)
+);
+CREATE INDEX IF NOT EXISTS assignment_classes_class_idx ON assignment_classes(class_id, assignment_id);
+CREATE TABLE IF NOT EXISTS assignment_items (
+  assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+  question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+  position INTEGER NOT NULL, max_score REAL NOT NULL DEFAULT 0, snapshot_json TEXT NOT NULL,
+  PRIMARY KEY(assignment_id, question_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS assignment_items_position_idx ON assignment_items(assignment_id, position);
+CREATE TABLE IF NOT EXISTS submissions (
+  id TEXT PRIMARY KEY NOT NULL, assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+  class_id TEXT NOT NULL REFERENCES teaching_classes(id) ON DELETE RESTRICT,
+  student_id TEXT NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'assigned', total_score REAL, teacher_comment TEXT NOT NULL DEFAULT '',
+  submitted_at TEXT, graded_at TEXT, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS submissions_assignment_class_student_idx ON submissions(assignment_id, class_id, student_id);
+CREATE INDEX IF NOT EXISTS submissions_assignment_status_idx ON submissions(assignment_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS submissions_student_idx ON submissions(student_id, updated_at);
+CREATE TABLE IF NOT EXISTS submission_scores (
+  submission_id TEXT NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+  question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+  score REAL NOT NULL DEFAULT 0, comment TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+  PRIMARY KEY(submission_id, question_id)
+);
+CREATE INDEX IF NOT EXISTS submission_scores_question_idx ON submission_scores(question_id, submission_id);
+CREATE TABLE IF NOT EXISTS model_profiles (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', display_name TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'openai-compatible', base_url TEXT NOT NULL, model TEXT NOT NULL,
+  api_key_ciphertext TEXT, api_key_iv TEXT, api_key_mask TEXT, is_managed INTEGER NOT NULL DEFAULT 0,
+  is_multimodal INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1, timeout_ms INTEGER NOT NULL DEFAULT 90000,
+  input_price_per_million REAL, output_price_per_million REAL, cache_price_per_million REAL,
+  cached_output_price_per_million REAL,
+  last_test_status TEXT, last_test_message TEXT, last_tested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS model_profiles_owner_idx ON model_profiles(owner_id, enabled);
+CREATE UNIQUE INDEX IF NOT EXISTS model_profiles_owner_name_idx ON model_profiles(owner_id, display_name);
+CREATE TABLE IF NOT EXISTS model_usage_events (
+  id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', model_profile_id TEXT,
+  document_id TEXT REFERENCES documents(id) ON DELETE SET NULL, page_number INTEGER,
+  page_count INTEGER NOT NULL DEFAULT 1, purpose TEXT NOT NULL,
+  provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_output_tokens INTEGER NOT NULL DEFAULT 0,
+  input_price_per_million REAL, output_price_per_million REAL, cache_price_per_million REAL,
+  cached_output_price_per_million REAL, cost_cny REAL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS model_usage_owner_created_idx ON model_usage_events(owner_id, created_at);
+CREATE INDEX IF NOT EXISTS model_usage_profile_created_idx ON model_usage_events(model_profile_id, created_at);
+CREATE INDEX IF NOT EXISTS model_usage_document_idx ON model_usage_events(document_id);
+CREATE TABLE IF NOT EXISTS app_settings (
+  owner_id TEXT PRIMARY KEY NOT NULL, teacher_mode TEXT NOT NULL DEFAULT 'personal', selected_model_profile_id TEXT,
+  extraction_concurrency INTEGER NOT NULL DEFAULT 2, extraction_paused INTEGER NOT NULL DEFAULT 0,
+  extraction_pause_reason TEXT, extraction_paused_at TEXT,
+  extraction_failure_streak INTEGER NOT NULL DEFAULT 0, preferred_region TEXT, preferred_textbook TEXT,
+  preferred_grades_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_jobs (
+  document_id TEXT PRIMARY KEY NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL DEFAULT 'local-demo', profile_id TEXT, status TEXT NOT NULL DEFAULT 'queued',
+  priority INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
+  lease_owner TEXT, lease_expires_at TEXT, last_error TEXT,
+  question_total INTEGER, completed_question_numbers_json TEXT NOT NULL DEFAULT '[]',
+  stream_phase TEXT NOT NULL DEFAULT 'queued', last_stream_event_at TEXT, stream_message TEXT,
+  queued_at TEXT NOT NULL,
+  started_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS document_jobs_queue_idx ON document_jobs(status, next_attempt_at, queued_at);
+CREATE INDEX IF NOT EXISTS document_jobs_owner_idx ON document_jobs(owner_id, status);
+`;
+
+const upgrades: Record<string, Record<string, string>> = {
+  documents: {
+    owner_id: "TEXT NOT NULL DEFAULT 'local-demo'",
+    original_key: "TEXT",
+    page_count: "INTEGER NOT NULL DEFAULT 0",
+    subject: "TEXT",
+    grade: "TEXT",
+    source_year: "INTEGER",
+    source_exam_type: "TEXT",
+    source_region: "TEXT",
+    source_textbook: "TEXT",
+    source_school: "TEXT",
+    checksum: "TEXT",
+    error: "TEXT",
+    source_removed_at: "TEXT",
+  },
+  pages: { status: "TEXT NOT NULL DEFAULT 'ready'", checksum: "TEXT" },
+  extraction_runs: {
+    page_id: "TEXT",
+    page_number: "INTEGER",
+    model_profile_id: "TEXT",
+    attempt: "INTEGER NOT NULL DEFAULT 1",
+    idempotency_key: "TEXT",
+    error_code: "TEXT",
+    next_attempt_at: "TEXT",
+    lease_owner: "TEXT",
+    lease_expires_at: "TEXT",
+    finished_at: "TEXT",
+  },
+  questions: {
+    confidence: "REAL NOT NULL DEFAULT 0",
+    needs_human_review: "INTEGER",
+    score: "INTEGER NOT NULL DEFAULT 0",
+    folder_id: "TEXT REFERENCES question_folders(id) ON DELETE SET NULL",
+    parent_question_id: "TEXT",
+    parent_external_id: "TEXT",
+    variation_kind: "TEXT",
+    variation_review_status: "TEXT",
+    variation_review_json: "TEXT",
+    missing_images_json: "TEXT NOT NULL DEFAULT '[]'",
+  },
+  question_assets: {
+    page_id: "TEXT",
+    role: "TEXT NOT NULL DEFAULT 'question'",
+    source_key: "TEXT",
+    crop_key: "TEXT",
+    position: "INTEGER NOT NULL DEFAULT 0",
+  },
+  papers: {
+    owner_id: "TEXT NOT NULL DEFAULT 'local-demo'",
+    folder_id: "TEXT REFERENCES paper_folders(id) ON DELETE SET NULL",
+    subtitle: "TEXT",
+    settings_json: "TEXT NOT NULL DEFAULT '{}'",
+  },
+  model_profiles: {
+    input_price_per_million: "REAL",
+    output_price_per_million: "REAL",
+    cache_price_per_million: "REAL",
+    cached_output_price_per_million: "REAL",
+  },
+  model_usage_events: {
+    page_count: "INTEGER NOT NULL DEFAULT 1",
+    cached_output_tokens: "INTEGER NOT NULL DEFAULT 0",
+    cached_output_price_per_million: "REAL",
+    cost_cny: "REAL",
+  },
+  app_settings: {
+    teacher_mode: "TEXT NOT NULL DEFAULT 'personal'",
+    extraction_concurrency: "INTEGER NOT NULL DEFAULT 2",
+    extraction_paused: "INTEGER NOT NULL DEFAULT 0",
+    extraction_pause_reason: "TEXT",
+    extraction_paused_at: "TEXT",
+    extraction_failure_streak: "INTEGER NOT NULL DEFAULT 0",
+    preferred_region: "TEXT",
+    preferred_textbook: "TEXT",
+    preferred_grades_json: "TEXT NOT NULL DEFAULT '[]'",
+  },
+  document_jobs: {
+    question_total: "INTEGER",
+    completed_question_numbers_json: "TEXT NOT NULL DEFAULT '[]'",
+    stream_phase: "TEXT NOT NULL DEFAULT 'queued'",
+    last_stream_event_at: "TEXT",
+    stream_message: "TEXT",
+  },
+};
+
+let initialized = false;
+
+function installBaseline(sqlite: ReturnType<typeof getSqlite>) {
+  sqlite.exec(schemaSql);
+  sqlite.exec(teachingSkillSchemaSql);
+  for (const [table, columns] of Object.entries(upgrades)) {
+    const info = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    const existing = new Set(info.map((column) => column.name));
+    for (const [name, definition] of Object.entries(columns)) {
+      if (!existing.has(name)) sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+    }
+  }
+  const usageColumns = new Set(
+    (sqlite.prepare("PRAGMA table_info(model_usage_events)").all() as Array<{ name: string }>).map((column) => column.name),
+  );
+  if (usageColumns.has("cost_usd") && usageColumns.has("cost_cny")) {
+    sqlite.exec("UPDATE model_usage_events SET cost_cny = cost_usd WHERE cost_cny IS NULL AND cost_usd IS NOT NULL");
+  }
+  sqlite.exec(
+    `UPDATE app_settings SET selected_model_profile_id = NULL
+       WHERE selected_model_profile_id IN (SELECT id FROM model_profiles WHERE is_managed = 1);
+     UPDATE document_jobs SET profile_id = NULL
+       WHERE profile_id IN (SELECT id FROM model_profiles WHERE is_managed = 1);
+     DELETE FROM model_profiles WHERE is_managed = 1;`,
+  );
+  sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS runs_idempotency_idx ON extraction_runs(idempotency_key)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS runs_queue_idx ON extraction_runs(status, next_attempt_at)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS document_jobs_queue_idx ON document_jobs(status, next_attempt_at, queued_at)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS document_jobs_owner_idx ON document_jobs(owner_id, status)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS documents_visible_created_idx ON documents(owner_id, created_at, id) WHERE source_removed_at IS NULL");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS documents_visible_name_idx ON documents(owner_id, name, id) WHERE source_removed_at IS NULL");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS runs_document_status_page_idx ON extraction_runs(document_id, status, page_number)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS questions_document_status_idx ON questions(document_id, status)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS paper_folders_owner_parent_idx ON paper_folders(owner_id, parent_id)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS papers_owner_folder_idx ON papers(owner_id, folder_id, updated_at)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS question_folders_owner_parent_idx ON question_folders(owner_id, parent_id)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS questions_folder_idx ON questions(folder_id, updated_at)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS questions_parent_idx ON questions(parent_question_id)");
+  sqlite.exec("CREATE INDEX IF NOT EXISTS bank_imports_owner_created_idx ON bank_imports(owner_id, created_at)");
+  sqlite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS bank_imports_active_package_idx ON bank_imports(owner_id, package_id)
+    WHERE status IN ('processing', 'complete')`);
+  installDatabaseInvariants(sqlite);
+  const migrationTime = new Date().toISOString();
+  repairApprovedQuestionReviewFlags(sqlite);
+  sqlite.prepare(
+    `INSERT INTO app_settings
+       (owner_id, extraction_paused, extraction_pause_reason, extraction_paused_at, extraction_failure_streak, updated_at)
+     SELECT owner_id, 1,
+       '检测到多份试卷同时处于退避状态，已暂停全部识别。请检查网络或模型 API 后点击“全部开始”。',
+       ?, 3, ?
+     FROM document_jobs j WHERE status = 'retry_wait'
+       AND NOT EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id=j.document_id AND r.error_code='incomplete_extraction')
+     GROUP BY owner_id HAVING COUNT(*) >= 3
+     ON CONFLICT(owner_id) DO UPDATE SET
+       extraction_paused = 1,
+       extraction_pause_reason = excluded.extraction_pause_reason,
+       extraction_paused_at = excluded.extraction_paused_at,
+       extraction_failure_streak = MAX(app_settings.extraction_failure_streak, 3),
+       updated_at = excluded.updated_at`,
+  ).run(migrationTime, migrationTime);
+  sqlite.prepare(
+    `UPDATE document_jobs SET status = 'paused', next_attempt_at = NULL, lease_owner = NULL,
+       lease_expires_at = NULL, finished_at = NULL, updated_at = ?
+     WHERE status IN ('queued', 'retry_wait', 'failed') AND owner_id IN (
+       SELECT owner_id FROM app_settings WHERE extraction_paused = 1
+     )`,
+  ).run(migrationTime);
+  sqlite.prepare(
+    `UPDATE extraction_runs SET status = 'paused', next_attempt_at = NULL,
+       lease_owner = NULL, lease_expires_at = NULL, finished_at = NULL
+     WHERE status <> 'complete' AND status <> 'running' AND document_id IN (
+       SELECT document_id FROM document_jobs WHERE status = 'paused'
+     )`,
+  ).run();
+  sqlite.prepare(
+    `UPDATE answer_imports SET status = 'failed', error = '服务重启中断了答案识别，请重新导入未完成页面', updated_at = ?
+      WHERE status = 'processing'`,
+  ).run(migrationTime);
+  sqlite.prepare(
+    `UPDATE document_jobs SET status = 'failed', next_attempt_at = NULL, lease_owner = NULL,
+       lease_expires_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ?,
+       last_error = (SELECT '原卷页面不完整：已保存 ' || COUNT(p.id) || '/' || d.page_count || ' 页，请重新上传同一 PDF 补齐'
+                       FROM documents d LEFT JOIN pages p ON p.document_id = d.id
+                      WHERE d.id = document_jobs.document_id GROUP BY d.id)
+     WHERE status = 'complete' AND EXISTS (
+       SELECT 1 FROM documents d WHERE d.id = document_jobs.document_id
+         AND d.page_count <> (SELECT COUNT(*) FROM pages p WHERE p.document_id = d.id)
+     )`,
+  ).run(migrationTime, migrationTime);
+  sqlite.prepare(
+    `UPDATE documents SET status = 'failed',
+       error = '原卷页面不完整：已保存 ' || (SELECT COUNT(*) FROM pages p WHERE p.document_id = documents.id)
+         || '/' || page_count || ' 页，请重新上传同一 PDF 补齐', updated_at = ?
+     WHERE status IN ('reviewing', 'complete')
+       AND page_count <> (SELECT COUNT(*) FROM pages p WHERE p.document_id = documents.id)`,
+  ).run(migrationTime);
+  repairFailedDocumentApprovals(sqlite, migrationTime);
+  sqlite.prepare(
+    `UPDATE extraction_runs SET status = 'queued', attempt = 0, error = NULL, error_code = NULL,
+       next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, finished_at = NULL
+     WHERE status = 'failed' AND document_id IN (
+       SELECT d.id FROM documents d LEFT JOIN document_jobs j ON j.document_id = d.id
+       WHERE j.document_id IS NULL AND d.status IN ('extracting', 'failed')
+     )`,
+  ).run();
+  sqlite.prepare(
+    `INSERT OR IGNORE INTO document_jobs
+      (document_id, owner_id, profile_id, status, priority, attempt, queued_at, updated_at)
+     SELECT d.id, d.owner_id, NULL, 'queued', 0, 0, ?, ? FROM documents d
+     WHERE d.status IN ('extracting', 'failed')
+       AND d.page_count > 0
+       AND (SELECT COUNT(*) FROM pages p WHERE p.document_id = d.id) = d.page_count
+       AND (SELECT MIN(p.page_number) FROM pages p WHERE p.document_id = d.id) = 1
+       AND (SELECT MAX(p.page_number) FROM pages p WHERE p.document_id = d.id) = d.page_count
+       AND EXISTS (SELECT 1 FROM pages p WHERE p.document_id = d.id)
+       AND EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id = d.id AND r.status <> 'complete')`,
+  ).run(migrationTime, migrationTime);
+  sqlite.prepare(
+    `UPDATE documents SET status = 'extracting', error = '历史任务已迁移到可靠队列，将从未完成页面继续', updated_at = ?
+     WHERE id IN (SELECT document_id FROM document_jobs WHERE status = 'queued' AND queued_at = ?)`,
+  ).run(migrationTime, migrationTime);
+  sqlite.prepare(
+    `UPDATE extraction_runs SET error = NULL, error_code = NULL, next_attempt_at = NULL,
+       lease_owner = NULL, lease_expires_at = NULL
+     WHERE status = 'complete' AND (error IS NOT NULL OR error_code IS NOT NULL OR next_attempt_at IS NOT NULL
+       OR lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL)`,
+  ).run();
+  const hasDuplicateQuestions = sqlite.prepare(
+    "SELECT 1 FROM questions GROUP BY document_id, number HAVING COUNT(*) > 1 LIMIT 1",
+  ).get();
+  if (hasDuplicateQuestions) {
+    sqlite.exec("DROP TABLE IF EXISTS temp._question_dedup");
+    sqlite.exec(
+    `CREATE TEMP TABLE _question_dedup AS
+     SELECT id,
+       FIRST_VALUE(id) OVER (
+         PARTITION BY document_id, number
+         ORDER BY
+           CASE WHEN bbox_json <> '{"x":0,"y":0,"width":10,"height":10}' THEN 0 ELSE 1 END,
+           CASE status WHEN 'approved' THEN 0 WHEN 'needs_attention' THEN 1 ELSE 2 END,
+           CASE WHEN bbox_json <> '{"x":0,"y":0,"width":10,"height":10}' THEN page_number ELSE -page_number END,
+           confidence DESC, created_at
+       ) AS keep_id
+     FROM questions`,
+  );
+    sqlite.exec(
+    `UPDATE questions AS keep SET
+       answer = CASE WHEN keep.answer = '' THEN COALESCE((
+         SELECT duplicate.answer FROM _question_dedup map
+         JOIN questions duplicate ON duplicate.id = map.id
+         WHERE map.keep_id = keep.id AND map.id <> map.keep_id AND duplicate.answer <> ''
+         ORDER BY LENGTH(duplicate.answer) DESC LIMIT 1
+       ), keep.answer) ELSE keep.answer END,
+       analysis = CASE WHEN keep.analysis = '' THEN COALESCE((
+         SELECT duplicate.analysis FROM _question_dedup map
+         JOIN questions duplicate ON duplicate.id = map.id
+         WHERE map.keep_id = keep.id AND map.id <> map.keep_id AND duplicate.analysis <> ''
+         ORDER BY LENGTH(duplicate.analysis) DESC LIMIT 1
+       ), keep.analysis) ELSE keep.analysis END,
+       score = MAX(keep.score, COALESCE((
+         SELECT MAX(duplicate.score) FROM _question_dedup map
+         JOIN questions duplicate ON duplicate.id = map.id
+         WHERE map.keep_id = keep.id
+       ), keep.score))
+     WHERE keep.id IN (SELECT keep_id FROM _question_dedup WHERE id <> keep_id)`,
+  );
+    sqlite.exec(
+    `INSERT OR IGNORE INTO question_tags(question_id, tag_id)
+     SELECT map.keep_id, qt.tag_id FROM _question_dedup map
+     JOIN question_tags qt ON qt.question_id = map.id
+     WHERE map.id <> map.keep_id`,
+  );
+    sqlite.exec("DELETE FROM questions WHERE id IN (SELECT id FROM _question_dedup WHERE id <> keep_id)");
+    sqlite.exec("DROP TABLE temp._question_dedup");
+  }
+  sqlite.prepare(
+    `UPDATE questions SET status = 'needs_attention', needs_human_review = 1, updated_at = ?
+      WHERE number = '' OR number GLOB '*[^0-9]*' OR CAST(number AS INTEGER) < 1
+         OR CAST(CAST(number AS INTEGER) AS TEXT) <> number`,
+  ).run(migrationTime);
+  sqlite.prepare(
+    `UPDATE documents SET status = 'reviewing', updated_at = ?
+      WHERE status = 'complete' AND EXISTS (
+        SELECT 1 FROM questions q WHERE q.document_id = documents.id
+          AND (q.number = '' OR q.number GLOB '*[^0-9]*' OR CAST(q.number AS INTEGER) < 1
+               OR CAST(CAST(q.number AS INTEGER) AS TEXT) <> q.number)
+      )`,
+  ).run(migrationTime);
+  sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS questions_document_number_idx ON questions(document_id, number)");
+  sqlite.exec("UPDATE question_assets SET role = 'question' WHERE role IS NULL OR role NOT IN ('question', 'answer')");
+  sqlite.exec(
+    `DELETE FROM question_assets WHERE id IN (
+       SELECT id FROM (
+         SELECT id, ROW_NUMBER() OVER (
+           PARTITION BY question_id, page_id, kind, label, bbox_json ORDER BY created_at, id
+         ) AS duplicate_position
+         FROM question_assets WHERE crop_key IS NULL
+       ) WHERE duplicate_position > 1
+     )`,
+  );
+}
+
+export const DATABASE_VERSION = 14;
+
+function initialize() {
+  runMigrations(getSqlite(), [
+    {
+      version: 1,
+      name: "existing-schema-and-integrity-baseline",
+      checksum: createHash("sha256").update(schemaSql + teachingSkillSchemaSql + JSON.stringify(upgrades)).digest("hex"),
+      up: installBaseline,
+    },
+    {
+      version: 2,
+      name: "independent-runtime-heartbeats",
+      checksum: "runtime-processes-v1",
+      up: sqlite => sqlite.exec(`CREATE TABLE runtime_processes (
+        id TEXT PRIMARY KEY, role TEXT NOT NULL, pid INTEGER NOT NULL,
+        started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL
+      ); CREATE INDEX runtime_processes_role_expiry_idx ON runtime_processes(role, expires_at)`),
+    },
+    {
+      version: 3,
+      name: "durable-pdf-preparation",
+      checksum: "document-preparations-v1",
+      up: sqlite => sqlite.exec(`CREATE TABLE document_preparations (
+        document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+        owner_id TEXT NOT NULL, profile_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('queued','processing','retry_wait','complete','failed')),
+        attempt INTEGER NOT NULL DEFAULT 0, completed_pages INTEGER NOT NULL DEFAULT 0,
+        lease_owner TEXT, lease_expires_at TEXT, next_attempt_at TEXT, last_error TEXT,
+        updated_at TEXT NOT NULL
+      ); CREATE INDEX document_preparations_claim_idx ON document_preparations(status, next_attempt_at, lease_expires_at)`),
+    },
+    {
+      version: 4,
+      name: "explicit-document-origin-and-paper-folders",
+      checksum: "document-origin-paper-folders-v1",
+      up: sqlite => sqlite.exec(`
+        ALTER TABLE documents ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'uploaded' CHECK(source_kind IN ('uploaded','imported','generated'));
+        ALTER TABLE documents ADD COLUMN paper_folder_id TEXT REFERENCES paper_folders(id) ON DELETE SET NULL;
+        UPDATE documents SET source_kind = 'imported' WHERE mime_type = 'application/x-jianti-import';
+        UPDATE documents SET source_kind = 'generated' WHERE mime_type = 'application/x-jianti-generated';
+        CREATE INDEX documents_paper_library_idx ON documents(owner_id, source_kind, paper_folder_id);
+      `),
+    },
+    {
+      version: 5,
+      name: "question-extraction-issues",
+      checksum: "question-extraction-issues-v1",
+      up: sqlite => sqlite.exec("ALTER TABLE questions ADD COLUMN extraction_issues_json TEXT NOT NULL DEFAULT '[]'"),
+    },
+    {
+      version: 6,
+      name: "independent-question-ai-review",
+      checksum: "question-ai-review-v1",
+      up: sqlite => sqlite.exec("ALTER TABLE questions ADD COLUMN ai_review_json TEXT"),
+    },
+    {
+      version: 7,
+      name: "model-service-selection",
+      checksum: "model-service-selection-v1",
+      up: sqlite => sqlite.exec("ALTER TABLE model_profiles ADD COLUMN service TEXT CHECK(service IN ('opencode','openrouter','custom'))"),
+    },
+    {
+      version: 8,
+      name: "opencode-go-service",
+      checksum: "opencode-go-service-v1",
+      up: sqlite => sqlite.exec(`
+        ALTER TABLE model_profiles ADD COLUMN service_next TEXT CHECK(service_next IN ('opencode','opencode-go','openrouter','custom'));
+        UPDATE model_profiles SET service_next = service;
+        ALTER TABLE model_profiles DROP COLUMN service;
+        ALTER TABLE model_profiles RENAME COLUMN service_next TO service;
+      `),
+    },
+    {
+      version: 9,
+      name: "optional-automatic-ai-review",
+      checksum: "optional-automatic-ai-review-v1",
+      up: sqlite => sqlite.exec(`
+        ALTER TABLE app_settings ADD COLUMN automatic_ai_review_enabled INTEGER NOT NULL DEFAULT 0 CHECK(automatic_ai_review_enabled IN (0,1));
+        ALTER TABLE document_jobs ADD COLUMN ai_review_enabled INTEGER NOT NULL DEFAULT 0 CHECK(ai_review_enabled IN (0,1));
+        UPDATE document_jobs SET ai_review_enabled = 1 WHERE EXISTS (
+          SELECT 1 FROM questions q WHERE q.document_id = document_jobs.document_id AND q.ai_review_json IS NOT NULL AND q.ai_review_json <> 'null'
+        );
+      `),
+    },
+    {
+      version: 10,
+      name: "document-list-query-indexes",
+      checksum: "document-list-query-indexes-v1",
+      // Existing databases have already applied installBaseline. Adding indexes
+      // there alone leaves their list queries scanning all completed runs.
+      up: sqlite => sqlite.exec(`
+        CREATE INDEX IF NOT EXISTS documents_visible_created_idx ON documents(owner_id, created_at, id) WHERE source_removed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS documents_visible_name_idx ON documents(owner_id, name, id) WHERE source_removed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS runs_document_status_page_idx ON extraction_runs(document_id, status, page_number);
+        CREATE INDEX IF NOT EXISTS questions_document_status_idx ON questions(document_id, status);
+      `),
+    },
+    { version: 11, name: "education-scope-isolation", checksum: "education-scope-isolation-v1", up: migrateEducationScopes },
+    {
+      version: 12,
+      name: "wrong-book-practice-explanation",
+      checksum: "wrong-book-practice-explanation-v1",
+      up: sqlite => sqlite.exec(`
+        ALTER TABLE questions ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'medium';
+
+        CREATE TABLE IF NOT EXISTS wrong_records (
+          id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', student_id TEXT,
+          question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+          source_type TEXT NOT NULL DEFAULT 'practice', source_id TEXT,
+          user_answer TEXT NOT NULL DEFAULT '', correct_answer TEXT NOT NULL DEFAULT '',
+          wrong_reason TEXT, first_wrong_at TEXT NOT NULL, last_reviewed_at TEXT,
+          review_count INTEGER NOT NULL DEFAULT 0, mastery_level TEXT NOT NULL DEFAULT 'unfamiliar',
+          status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS wrong_records_owner_status_idx ON wrong_records(owner_id, status, updated_at);
+        CREATE INDEX IF NOT EXISTS wrong_records_student_idx ON wrong_records(student_id, updated_at);
+        CREATE INDEX IF NOT EXISTS wrong_records_question_idx ON wrong_records(question_id);
+
+        CREATE TABLE IF NOT EXISTS learning_records (
+          id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', student_id TEXT,
+          session_id TEXT REFERENCES practice_sessions(id) ON DELETE SET NULL,
+          question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+          answer TEXT NOT NULL DEFAULT '', is_correct INTEGER NOT NULL DEFAULT 0,
+          score REAL NOT NULL DEFAULT 0, time_spent_ms INTEGER NOT NULL DEFAULT 0,
+          source_type TEXT NOT NULL DEFAULT 'practice', attempted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS learning_records_owner_student_idx ON learning_records(owner_id, student_id, attempted_at);
+        CREATE INDEX IF NOT EXISTS learning_records_question_idx ON learning_records(question_id);
+        CREATE INDEX IF NOT EXISTS learning_records_session_idx ON learning_records(session_id);
+
+        CREATE TABLE IF NOT EXISTS practice_sessions (
+          id TEXT PRIMARY KEY NOT NULL, owner_id TEXT NOT NULL DEFAULT 'local-demo', student_id TEXT,
+          paper_id TEXT REFERENCES papers(id) ON DELETE SET NULL, version_code TEXT NOT NULL DEFAULT 'A',
+          title TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'practice', status TEXT NOT NULL DEFAULT 'active',
+          total_score REAL, start_at TEXT NOT NULL, duration_minutes INTEGER, end_at TEXT, submitted_at TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS practice_sessions_owner_student_idx ON practice_sessions(owner_id, student_id, updated_at);
+        CREATE INDEX IF NOT EXISTS practice_sessions_paper_idx ON practice_sessions(paper_id);
+
+        CREATE TABLE IF NOT EXISTS practice_items (
+          id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+          question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE, position INTEGER NOT NULL,
+          user_answer TEXT NOT NULL DEFAULT '', is_correct INTEGER NOT NULL DEFAULT 0,
+          score REAL NOT NULL DEFAULT 0, max_score REAL NOT NULL DEFAULT 0, time_spent_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS practice_items_session_idx ON practice_items(session_id);
+        CREATE INDEX IF NOT EXISTS practice_items_question_idx ON practice_items(question_id);
+
+        CREATE TABLE IF NOT EXISTS explanations (
+          id TEXT PRIMARY KEY NOT NULL, question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+          type TEXT NOT NULL DEFAULT 'text', content TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT 'ai', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS explanations_question_idx ON explanations(question_id);
+
+        CREATE TABLE IF NOT EXISTS paper_versions (
+          id TEXT PRIMARY KEY NOT NULL, paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+          version_code TEXT NOT NULL DEFAULT 'A', question_ids_json TEXT NOT NULL, seed TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS paper_versions_paper_idx ON paper_versions(paper_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS paper_versions_paper_version_idx ON paper_versions(paper_id, version_code);
+      `),
+    },
+    {
+      version: 13,
+      name: "multi-tenant-teachers",
+      checksum: "multi-tenant-teachers-v1",
+      up: sqlite => sqlite.exec(`
+        ALTER TABLE documents ADD COLUMN school TEXT;
+
+        CREATE TABLE IF NOT EXISTS teachers (
+          id TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+          name TEXT NOT NULL, school TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'teacher',
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS teachers_school_subject_idx ON teachers(school, subject);
+        CREATE INDEX IF NOT EXISTS teachers_username_idx ON teachers(username);
+      `),
+    },
+    {
+      version: 14,
+      name: "system-settings-table",
+      checksum: "system-settings-table-v1",
+      up: sqlite => sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS system_settings (
+          id TEXT PRIMARY KEY NOT NULL,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `),
+    },
+  ]);
+  initialized = true;
+}
+
+export async function ensureDatabase() {
+  if (!initialized) initialize();
+}

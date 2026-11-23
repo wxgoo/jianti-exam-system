@@ -1,0 +1,26 @@
+import { headers } from "next/headers";
+import { notFound } from "next/navigation";
+import { PaperBuilder } from "../../../components/PaperBuilder";
+import { getPaperTemplates } from "../../../lib/backend-data";
+import { normalizePaperSettings } from "../../../lib/paper-templates";
+import { getApprovedQuestions, getPaperData } from "../../../lib/backend-data";
+
+export const metadata = { title: "编辑试卷 · 拣题" };
+
+export default async function EditPaperPage({ params }: { params: Promise<{ paperId: string }> }) {
+  const { paperId } = await params;
+  const requestHeaders = await headers();
+  const ownerId = requestHeaders.get("oai-authenticated-user-id") ?? "local-demo";
+  const [paper, questions, templates] = await Promise.all([
+    getPaperData(paperId, ownerId),
+    getApprovedQuestions(ownerId),
+    getPaperTemplates(ownerId),
+  ]);
+  if (!paper) notFound();
+  // Only persisted paper items belong in the restored sections. The bank is
+  // the candidate pool, never the source of the saved paper's membership.
+  const settings = normalizePaperSettings(paper.settings, paper.questions);
+  const availableQuestions = [...new Map([...questions, ...paper.questions].map((question) => [question.id, question])).values()];
+  const initialIds = settings.sections.flatMap((section) => section.questionIds);
+  return <PaperBuilder key={paper.id} questions={availableQuestions} initialIds={initialIds} templates={templates} initialPaper={{ id: paper.id, title: paper.title, subtitle: paper.subtitle, settings }} />;
+}

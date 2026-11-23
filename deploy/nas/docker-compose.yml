@@ -1,0 +1,73 @@
+# ================================================================================
+# jianti-exam-system — NAS（群晖 DSM / 威联通 QNAP / 任何 Docker）一键部署
+# ================================================================================
+#
+# 【推荐】方式 A · 从 GitHub Container Registry 拉预构建镜像（免本机 build，首次启动最快）
+#   1. 把这个文件下载到 NAS 任意目录，比如 /volume1/docker/jianti/docker-compose.yml
+#   2. 改下 APP_BASE_URL 里的 <你的NAS_IP> 或域名
+#   3. docker compose pull && docker compose up -d
+#
+# 【可选】方式 B · 本地构建（需要把源码上传到 NAS，第一次慢但可改 Dockerfile）
+#   1. 在源码根目录下运行：cd deploy/nas && docker compose up -d --build
+#   2. docker-compose.yml 里保留了 build: 段，和 image: 同时存在时会走 build
+#      （如果想强制拉远程镜像，注释掉 build: 那 3 行即可）
+#
+# 常用命令：
+#   docker compose logs -f                # 看实时日志
+#   docker compose ps                     # 看状态
+#   docker compose down                   # 停止（数据保留）
+#   docker compose pull && docker compose up -d  # 升级到最新镜像
+#
+# 数据持久化：
+#   SQLite 题库 + 上传文件 → 容器内 /app/data → 自动落到 jianti_data 命名卷
+#   （群晖 DSM: 容器管理器 → 卷  里能看到；down 不丢数据，down -v 才会清）
+#
+# 解压后端（第一试卷网自动入库必需）：
+#   Dockerfile 里已经 apt-get install unrar p7zip-full + pip install rarfile
+#   容器启动后开箱即用，archive-extract.ts 自动探测到 unrar。
+# ================================================================================
+
+services:
+  jianti:
+    # ---- 远程镜像（推荐）----
+    # 推 GitHub 后镜像路径自动是 ghcr.io/<你的Github用户名>/jianti-exam-system
+    # 例：ghcr.io/yourname/jianti-exam-system:latest
+    image: ghcr.io/<你的Github用户名>/jianti-exam-system:latest
+    # 如果你还没推过远程镜像，注释掉 image 行 → 取消下面 build 的注释 走本地 build
+    # build:
+    #   context: ../..                     # 源码根目录
+    #   dockerfile: deploy/nas/Dockerfile
+
+    # 拉取策略：有新镜像就拉，没有也能用本地缓存
+    pull_policy: always
+
+    restart: unless-stopped
+
+    ports:
+      - "3050:3050"                       # Web（必需）
+      - "3051:3051"                       # API（可只映射 3050）
+
+    environment:
+      # ⚠️ 改成你的 NAS IP 或域名
+      - APP_BASE_URL=http://<你的NAS_IP>:3050
+      - JIANTI_WEB_PORT=3050
+      - JIANTI_API_PORT=3051
+      - TZ=Asia/Shanghai                  # 时区
+
+    volumes:
+      # 推荐：命名卷（Docker 自动管理，群晖本地磁盘）
+      - jianti_data:/app/data
+      # 或：绑定目录（DSM 容器管理器里手动建）
+      # - /volume1/docker/jianti/data:/app/data
+
+    # 健康检查（DSM 7.2+ 容器管理器里会显示绿/红）
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3050/api/ready').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  jianti_data:
+    # 群晖: DSM 容器管理器会在卷1 上自动生成

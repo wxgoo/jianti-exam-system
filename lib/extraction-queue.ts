@@ -1,0 +1,662 @@
+import { documentScopeSql, type EducationScope } from "./education-scope";
+import "server-only";
+import { getExtractionSpeed } from "./extraction-speed";
+import { automaticAiReviewEnabled } from "./ai-review-settings";
+
+import type Database from "better-sqlite3";
+import { getSqlite, sqliteTransaction } from "../db";
+import { ensureDatabase } from "../db/bootstrap";
+import { resolveModelProfile } from "./model-profiles";
+import { now } from "./server";
+import {
+  effectiveExtractionAttempt,
+  MAX_EXTRACTION_ATTEMPTS,
+  retryDelayMs,
+  shouldPauseExtraction,
+} from "./extraction-retry";
+import { getDocumentIntegrity, integrityError } from "./document-integrity";
+import { assertDocumentLease, LostDocumentLeaseError, renewDocumentLease } from "./job-lease";
+import { availableQueueCapacity, DEFAULT_UPLOAD_CONCURRENCY, normalizeUploadConcurrency } from "./upload-concurrency";
+import { countsTowardExtractionCircuit, EXTRACTION_CIRCUIT_FAILURE_THRESHOLD, recordExtractionFailure, resetExtractionFailureStreak } from "./extraction-circuit";
+
+const LEASE_MS = 90_000;
+const HEARTBEAT_MS = 25_000;
+
+type JobRow = {
+  documentId: string;
+  ownerId: string;
+  profileId: string | null;
+  attempt: number;
+};
+
+type RunRow = {
+  id: string;
+  pageId: string;
+  pageNumber: number;
+  attempt: number;
+};
+
+type ExtractionFailure = {
+  savedQuestionCount?: number;
+  error?: string;
+  code?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
+};
+
+type QueueSettingsRow = {
+  concurrency: number;
+  paused: number;
+  pauseReason: string | null;
+  pausedAt: string | null;
+  failureStreak: number;
+};
+
+declare global {
+  var __teacherDbQueuePump: Promise<void> | undefined;
+  var __teacherDbQueueTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+function futureIso(delayMs: number) {
+  return new Date(Date.now() + delayMs).toISOString();
+}
+
+function schedulePump(delayMs = 0) {
+  if (process.env.JIANTI_PROCESS_ROLE !== "worker" && process.env.JIANTI_EMBEDDED_WORKER !== "1") return;
+  if (global.__teacherDbQueueTimer) clearTimeout(global.__teacherDbQueueTimer);
+  global.__teacherDbQueueTimer = setTimeout(() => {
+    global.__teacherDbQueueTimer = undefined;
+    void kickExtractionQueue();
+  }, Math.max(0, delayMs));
+  global.__teacherDbQueueTimer.unref?.();
+}
+
+export async function enqueueDocumentExtraction(input: {
+  ownerId: string;
+  documentId: string;
+  profileId?: string;
+  retry?: boolean;
+  commit?: (transaction: Database.Database) => void;
+}) {
+  await ensureDatabase();
+  const sqlite = getSqlite();
+  const document = sqlite.prepare(
+    "SELECT id FROM documents WHERE id = ? AND owner_id = ?",
+  ).get(input.documentId, input.ownerId) as { id: string } | undefined;
+  if (!document) throw new Error("文档不存在");
+  const integrity = getDocumentIntegrity(sqlite, input.documentId)!;
+  if (integrity.missingPageNumbers.length || integrity.unexpectedPageNumbers.length || !integrity.storedPageNumbers.length) {
+    throw new Error(integrityError(integrity));
+  }
+  const pages = sqlite.prepare(
+    "SELECT id, page_number AS pageNumber FROM pages WHERE document_id = ? ORDER BY page_number",
+  ).all(input.documentId) as Array<{ id: string; pageNumber: number }>;
+  const profile = await resolveModelProfile(input.ownerId, input.profileId);
+  const timestamp = now();
+  const queueSettings = getQueueSettingsRow(sqlite, input.ownerId);
+  const queueStatus = queueSettings?.paused ? "paused" : "queued";
+  const pausedReason = queueSettings?.pauseReason ?? "识别队列已暂停，请点击“全部开始”后继续。";
+  sqliteTransaction((transaction) => {
+    input.commit?.(transaction);
+    // 整卷识别必须从同一份页面快照开始；旧的逐页运行记录不能混入新一轮进度。
+    transaction.prepare("DELETE FROM extraction_runs WHERE document_id = ?").run(input.documentId);
+    for (const page of pages) {
+      transaction.prepare(
+        `INSERT OR IGNORE INTO extraction_runs
+          (id, document_id, page_id, page_number, model_profile_id, provider, model, status, attempt, idempotency_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      ).run(
+        crypto.randomUUID(), input.documentId, page.id, page.pageNumber, profile.id,
+        profile.provider, profile.model, queueStatus, `${input.documentId}:page:${page.pageNumber}:extract-v4`, timestamp,
+      );
+    }
+    if (input.retry) {
+      transaction.prepare(
+        `UPDATE extraction_runs SET status = ?, error = NULL, error_code = NULL,
+           next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, finished_at = NULL,
+           attempt = CASE WHEN status = 'failed' THEN 0 ELSE attempt END
+         WHERE document_id = ? AND status <> 'complete'`,
+      ).run(queueStatus, input.documentId);
+      transaction.prepare("UPDATE document_jobs SET attempt = 0 WHERE document_id = ?")
+        .run(input.documentId);
+    }
+    transaction.prepare(
+      `INSERT INTO document_jobs
+        (document_id, owner_id, profile_id, status, priority, attempt, question_total,
+         completed_question_numbers_json, stream_phase, stream_message, queued_at, updated_at)
+       VALUES (?, ?, ?, ?, 0, 0, NULL, '[]', ?, ?, ?, ?)
+       ON CONFLICT(document_id) DO UPDATE SET
+         owner_id = excluded.owner_id, profile_id = excluded.profile_id, status = excluded.status,
+         next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+         last_error = NULL,
+         stream_phase = excluded.stream_phase, last_stream_event_at = NULL,
+         stream_message = excluded.stream_message, finished_at = NULL, updated_at = excluded.updated_at`,
+    ).run(
+      input.documentId, input.ownerId, profile.id, queueStatus,
+      queueStatus === "paused" ? "paused" : "queued",
+      queueStatus === "paused" ? pausedReason : "等待整卷模型调用",
+      timestamp, timestamp,
+    );
+    transaction.prepare("UPDATE documents SET status = 'extracting', error = ?, updated_at = ? WHERE id = ?")
+      .run(queueSettings?.paused ? pausedReason : null, timestamp, input.documentId);
+  });
+  if (!queueSettings?.paused) schedulePump();
+  return getDocumentJob(input.ownerId, input.documentId);
+}
+
+export function getDocumentJob(ownerId: string, documentId: string) {
+  return getSqlite().prepare(
+    `SELECT document_id AS documentId, status, attempt, next_attempt_at AS nextAttemptAt,
+       last_error AS lastError, queued_at AS queuedAt, started_at AS startedAt,
+       finished_at AS finishedAt, updated_at AS updatedAt, question_total AS questionTotal,
+       completed_question_numbers_json AS completedQuestionNumbersJson,
+       stream_phase AS streamPhase, last_stream_event_at AS lastStreamEventAt,
+       stream_message AS streamMessage
+     FROM document_jobs WHERE owner_id = ? AND document_id = ?`,
+  ).get(ownerId, documentId);
+}
+
+export async function listDocumentJobs(ownerId: string) {
+  await ensureDatabase();
+  const jobs = getSqlite().prepare(
+    `SELECT j.document_id AS documentId, d.name, j.status, j.attempt,
+       j.profile_id AS modelProfileId,
+       COALESCE(mp.display_name, MAX(CASE WHEN r.model <> 'pending' THEN r.model END)) AS modelDisplayName,
+       COALESCE(mp.model, MAX(CASE WHEN r.model <> 'pending' THEN r.model END)) AS modelName,
+       COALESCE(mp.provider, MAX(CASE WHEN r.model <> 'pending' THEN r.provider END)) AS modelProvider,
+       j.next_attempt_at AS nextAttemptAt, j.last_error AS lastError,
+       j.queued_at AS queuedAt, j.started_at AS startedAt, j.finished_at AS finishedAt,
+       j.question_total AS questionTotal,
+       COALESCE(json_array_length(j.completed_question_numbers_json), 0) AS completedQuestionCount,
+       j.stream_phase AS streamPhase, j.stream_message AS streamMessage,
+       d.page_count AS totalPages,
+       SUM(CASE WHEN r.status = 'complete' THEN 1 ELSE 0 END) AS completedPages,
+       SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failedPages,
+       SUM(CASE WHEN r.status = 'retry_wait' THEN 1 ELSE 0 END) AS retryWaitPages
+     FROM document_jobs j
+     JOIN documents d ON d.id = j.document_id
+     LEFT JOIN extraction_runs r ON r.document_id = j.document_id
+     LEFT JOIN model_profiles mp ON mp.id = j.profile_id AND mp.owner_id = j.owner_id
+     WHERE j.owner_id = ?
+     GROUP BY j.document_id
+     ORDER BY j.queued_at DESC LIMIT 100`,
+  ).all(ownerId);
+  schedulePump();
+  return jobs;
+}
+
+function getQueueSettingsRow(sqlite: Database.Database, ownerId: string) {
+  return sqlite.prepare(
+    `SELECT extraction_concurrency AS concurrency, extraction_paused AS paused,
+       extraction_pause_reason AS pauseReason, extraction_paused_at AS pausedAt,
+       extraction_failure_streak AS failureStreak
+     FROM app_settings WHERE owner_id = ?`,
+  ).get(ownerId) as QueueSettingsRow | undefined;
+}
+
+function automaticPauseReason(message: string) {
+  return `连续 ${EXTRACTION_CIRCUIT_FAILURE_THRESHOLD} 次识别请求失败，已暂停全部任务。请检查网络或模型 API 后点击“全部开始”。最近错误：${message}`.slice(0, 1000);
+}
+
+function parkWaitingJobs(sqlite: Database.Database, ownerId: string, reason: string, timestamp: string) {
+  sqlite.prepare(
+    `UPDATE document_jobs SET status = 'paused', next_attempt_at = NULL, lease_owner = NULL,
+       lease_expires_at = NULL, last_error = ?, stream_phase = 'paused', stream_message = ?,
+       finished_at = NULL, updated_at = ?
+     WHERE owner_id = ? AND status IN ('queued', 'retry_wait', 'failed')
+       AND NOT EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id=document_jobs.document_id AND r.error_code='source_only')`,
+  ).run(reason, reason, timestamp, ownerId);
+  sqlite.prepare(
+    `UPDATE extraction_runs SET status = 'paused', next_attempt_at = NULL,
+       lease_owner = NULL, lease_expires_at = NULL, finished_at = NULL
+     WHERE status <> 'complete' AND status <> 'running' AND document_id IN (
+       SELECT document_id FROM document_jobs WHERE owner_id = ? AND status = 'paused'
+         AND NOT EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id=document_jobs.document_id AND r.error_code='source_only')
+     )`,
+  ).run(ownerId);
+  sqlite.prepare(
+    `UPDATE documents SET status = 'extracting', error = ?, updated_at = ?
+     WHERE id IN (SELECT document_id FROM document_jobs WHERE owner_id = ? AND status = 'paused'
+       AND NOT EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id=document_jobs.document_id AND r.error_code='source_only'))`,
+  ).run(reason, timestamp, ownerId);
+}
+
+function parkClaimedJob(sqlite: Database.Database, job: JobRow & { workerId: string }, reason: string, timestamp: string) {
+  assertDocumentLease(sqlite, job.documentId, job.workerId, timestamp);
+  sqlite.prepare(
+    `UPDATE extraction_runs SET status = 'paused', next_attempt_at = NULL,
+       lease_owner = NULL, lease_expires_at = NULL, finished_at = NULL
+     WHERE document_id = ? AND status <> 'complete'`,
+  ).run(job.documentId);
+  sqlite.prepare(
+    `UPDATE document_jobs SET status = 'paused', next_attempt_at = NULL, lease_owner = NULL,
+       lease_expires_at = NULL, last_error = ?, stream_phase = 'paused', stream_message = ?,
+       finished_at = NULL, updated_at = ?
+     WHERE document_id = ? AND lease_owner = ?`,
+  ).run(reason, reason, timestamp, job.documentId, job.workerId);
+  sqlite.prepare("UPDATE documents SET status = 'extracting', error = ?, updated_at = ? WHERE id = ?")
+    .run(reason, timestamp, job.documentId);
+}
+
+function recordQueueFailure(sqlite: Database.Database, ownerId: string, message: string, timestamp: string) {
+  const current = getQueueSettingsRow(sqlite, ownerId);
+  if (current?.paused) return { paused: true, reason: current.pauseReason ?? "识别队列已暂停" };
+  const state = recordExtractionFailure(current?.failureStreak);
+  sqlite.prepare(
+    `INSERT INTO app_settings (owner_id, extraction_failure_streak, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(owner_id) DO UPDATE SET
+       extraction_failure_streak = excluded.extraction_failure_streak,
+       updated_at = excluded.updated_at`,
+  ).run(ownerId, state.failureStreak, timestamp);
+  if (!state.shouldPause) return { paused: false, reason: null };
+  const reason = automaticPauseReason(message);
+  sqlite.prepare(
+    `UPDATE app_settings SET extraction_paused = 1, extraction_pause_reason = ?,
+       extraction_paused_at = ?, updated_at = ? WHERE owner_id = ?`,
+  ).run(reason, timestamp, timestamp, ownerId);
+  parkWaitingJobs(sqlite, ownerId, reason, timestamp);
+  return { paused: true, reason };
+}
+
+function recordQueueSuccess(ownerId: string) {
+  getSqlite().prepare(
+    `UPDATE app_settings SET extraction_failure_streak = ?, updated_at = ?
+     WHERE owner_id = ? AND extraction_paused = 0 AND extraction_failure_streak <> 0`,
+  ).run(resetExtractionFailureStreak(), now(), ownerId);
+}
+
+function isQueuePaused(ownerId: string) {
+  return Boolean(getQueueSettingsRow(getSqlite(), ownerId)?.paused);
+}
+
+export async function getExtractionQueueSettings(ownerId: string, scope?: EducationScope) {
+  await ensureDatabase();
+  const sqlite = getSqlite();
+  const settings = getQueueSettingsRow(sqlite, ownerId);
+  const filter = documentScopeSql(scope);
+  const counts = sqlite.prepare(
+    `SELECT
+       SUM(CASE WHEN status = 'processing' AND lease_expires_at >= ? THEN 1 ELSE 0 END) AS activeCount,
+       SUM(CASE WHEN status IN ('queued', 'retry_wait') THEN 1 ELSE 0 END) AS queuedCount,
+       SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END) AS pausedCount
+     FROM document_jobs WHERE owner_id = ?${scope ? ` AND document_id IN (SELECT d.id FROM documents d WHERE 1=1${filter.sql})` : ""}`,
+  ).get(now(), ownerId, ...filter.params) as { activeCount: number | null; queuedCount: number | null; pausedCount: number | null };
+  return {
+    concurrency: normalizeUploadConcurrency(settings?.concurrency, DEFAULT_UPLOAD_CONCURRENCY),
+    automaticAiReviewEnabled: automaticAiReviewEnabled(ownerId),
+    paused: Boolean(settings?.paused),
+    pauseReason: settings?.pauseReason ?? null,
+    pausedAt: settings?.pausedAt ?? null,
+    failureStreak: Number(settings?.failureStreak ?? 0),
+    activeCount: Number(counts.activeCount ?? 0),
+    queuedCount: Number(counts.queuedCount ?? 0),
+    pausedCount: Number(counts.pausedCount ?? 0),
+    speed: getExtractionSpeed(sqlite, ownerId, new Date(), scope),
+  };
+}
+
+export async function setExtractionQueueConcurrency(ownerId: string, value: unknown) {
+  await ensureDatabase();
+  const concurrency = normalizeUploadConcurrency(value);
+  const timestamp = now();
+  getSqlite().prepare(
+    `INSERT INTO app_settings (owner_id, extraction_concurrency, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(owner_id) DO UPDATE SET
+       extraction_concurrency = excluded.extraction_concurrency,
+       updated_at = excluded.updated_at`,
+  ).run(ownerId, concurrency, timestamp);
+  schedulePump();
+  return getExtractionQueueSettings(ownerId);
+}
+
+export async function setExtractionQueuePaused(ownerId: string, paused: boolean) {
+  await ensureDatabase();
+  const timestamp = now();
+  const changed = sqliteTransaction((transaction) => {
+    if (paused) {
+      const reason = "已手动暂停全部识别任务。检查完成后点击“全部开始”即可继续。";
+      transaction.prepare(
+        `INSERT INTO app_settings
+           (owner_id, extraction_paused, extraction_pause_reason, extraction_paused_at, extraction_failure_streak, updated_at)
+         VALUES (?, 1, ?, ?, 0, ?)
+         ON CONFLICT(owner_id) DO UPDATE SET
+           extraction_paused = 1, extraction_pause_reason = excluded.extraction_pause_reason,
+           extraction_paused_at = excluded.extraction_paused_at, extraction_failure_streak = 0,
+           updated_at = excluded.updated_at`,
+      ).run(ownerId, reason, timestamp, timestamp);
+      parkWaitingJobs(transaction, ownerId, reason, timestamp);
+      return (transaction.prepare(
+        "SELECT COUNT(*) AS count FROM document_jobs WHERE owner_id = ? AND status = 'paused'",
+      ).get(ownerId) as { count: number }).count;
+    }
+    transaction.prepare(
+      `INSERT INTO app_settings
+         (owner_id, extraction_paused, extraction_failure_streak, updated_at)
+       VALUES (?, 0, 0, ?)
+       ON CONFLICT(owner_id) DO UPDATE SET
+         extraction_paused = 0, extraction_pause_reason = NULL, extraction_paused_at = NULL,
+         extraction_failure_streak = 0, updated_at = excluded.updated_at`,
+    ).run(ownerId, timestamp);
+    transaction.prepare(
+      `UPDATE extraction_runs SET status = 'queued', attempt = 0, error = NULL, error_code = NULL,
+         next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, finished_at = NULL
+       WHERE status <> 'complete' AND document_id IN (
+         SELECT document_id FROM document_jobs
+         WHERE owner_id = ? AND status IN ('paused', 'retry_wait', 'failed', 'queued')
+           AND NOT EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id=document_jobs.document_id AND r.error_code='source_only')
+       )`,
+    ).run(ownerId);
+    const resumed = transaction.prepare(
+      `UPDATE document_jobs SET status = 'queued', attempt = 0, next_attempt_at = NULL,
+         lease_owner = NULL, lease_expires_at = NULL, last_error = NULL, stream_phase = 'queued',
+         stream_message = '等待从未完成题目继续', last_stream_event_at = NULL,
+         finished_at = NULL, updated_at = ?
+       WHERE owner_id = ? AND status IN ('paused', 'retry_wait', 'failed', 'queued')
+         AND NOT EXISTS (SELECT 1 FROM extraction_runs r WHERE r.document_id=document_jobs.document_id AND r.error_code='source_only')`,
+    ).run(timestamp, ownerId);
+    transaction.prepare(
+      `UPDATE documents SET status = 'extracting', error = NULL, updated_at = ?
+       WHERE id IN (SELECT document_id FROM document_jobs WHERE owner_id = ? AND status = 'queued')`,
+    ).run(timestamp, ownerId);
+    return resumed.changes;
+  });
+  if (!paused) schedulePump();
+  return { ...await getExtractionQueueSettings(ownerId), changed: Number(changed) };
+}
+
+function claimJobs() {
+  const timestamp = now();
+  return sqliteTransaction((transaction) => {
+    transaction.prepare(
+      `UPDATE document_jobs SET status = 'retry_wait', next_attempt_at = ?, lease_owner = NULL,
+         lease_expires_at = NULL, stream_phase = 'retry_wait', stream_message = '工作进程中断，等待自动恢复',
+         last_error = COALESCE(last_error, '工作进程中断，已自动恢复'), updated_at = ?
+       WHERE status = 'processing' AND lease_expires_at <= ?`,
+    ).run(timestamp, timestamp, timestamp);
+    transaction.prepare(
+      `UPDATE extraction_runs SET status = 'retry_wait', next_attempt_at = ?,
+         error = COALESCE(error, '工作进程租约过期，等待自动恢复')
+       WHERE status = 'running' AND document_id IN (
+         SELECT document_id FROM document_jobs WHERE status = 'retry_wait' AND next_attempt_at = ?
+       )`,
+    ).run(timestamp, timestamp);
+    const pausedOwners = transaction.prepare(
+      "SELECT owner_id AS ownerId, extraction_pause_reason AS reason FROM app_settings WHERE extraction_paused = 1",
+    ).all() as Array<{ ownerId: string; reason: string | null }>;
+    for (const owner of pausedOwners) {
+      parkWaitingJobs(transaction, owner.ownerId, owner.reason ?? "识别队列已暂停", timestamp);
+    }
+    const owners = transaction.prepare(
+      `SELECT DISTINCT owner_id AS ownerId FROM document_jobs
+       WHERE status = 'processing'
+          OR (status IN ('queued', 'retry_wait') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))`,
+    ).all(timestamp) as Array<{ ownerId: string }>;
+    const claimed: JobRow[] = [];
+    for (const { ownerId } of owners) {
+      const setting = getQueueSettingsRow(transaction, ownerId);
+      if (setting?.paused) continue;
+      const active = (transaction.prepare(
+        "SELECT COUNT(*) AS count FROM document_jobs WHERE owner_id = ? AND status = 'processing' AND lease_expires_at >= ?",
+      ).get(ownerId, timestamp) as { count: number }).count;
+      const capacity = availableQueueCapacity(setting?.concurrency ?? DEFAULT_UPLOAD_CONCURRENCY, active);
+      if (!capacity) continue;
+      const candidates = transaction.prepare(
+        `SELECT document_id AS documentId, owner_id AS ownerId, profile_id AS profileId, attempt
+         FROM document_jobs
+         WHERE owner_id = ? AND status IN ('queued', 'retry_wait')
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         ORDER BY priority DESC, queued_at ASC LIMIT ?`,
+      ).all(ownerId, timestamp, capacity) as JobRow[];
+      for (const job of candidates) {
+        const workerId = crypto.randomUUID();
+        transaction.prepare(
+          `UPDATE document_jobs SET status = 'processing', lease_owner = ?, lease_expires_at = ?,
+             next_attempt_at = NULL, last_error = NULL, stream_phase = 'preparing',
+             stream_message = '等待本地图像预处理', last_stream_event_at = NULL,
+             started_at = COALESCE(started_at, ?), attempt = attempt + 1, updated_at = ?
+           WHERE document_id = ?`,
+        ).run(workerId, futureIso(LEASE_MS), timestamp, timestamp, job.documentId);
+        (job as JobRow & { workerId: string }).workerId = workerId;
+        job.attempt += 1;
+        claimed.push(job);
+      }
+    }
+    return claimed;
+  }) as Array<JobRow & { workerId: string }>;
+}
+
+function heartbeat(documentId: string, workerId: string) {
+  const timestamp = now();
+  return renewDocumentLease(getSqlite(), documentId, workerId, timestamp, futureIso(LEASE_MS));
+}
+
+function nextRun(documentId: string) {
+  const timestamp = now();
+  return getSqlite().prepare(
+    `SELECT id, page_id AS pageId, page_number AS pageNumber, attempt
+     FROM extraction_runs
+     WHERE document_id = ? AND status <> 'complete'
+       AND status <> 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+     ORDER BY page_number LIMIT 1`,
+  ).get(documentId, timestamp) as RunRow | undefined;
+}
+
+async function finishDocument(job: JobRow & { workerId: string }) {
+  const { finalizeDocument } = await import("../server/services/document-finalize");
+  const outcome = await finalizeDocument(job.ownerId, job.documentId, job.workerId);
+  if (outcome.status >= 400) throw new Error("error" in outcome.body ? String(outcome.body.error) : "整卷收尾失败");
+}
+
+async function processJob(job: JobRow & { workerId: string }) {
+  const beat = setInterval(() => { heartbeat(job.documentId, job.workerId); }, HEARTBEAT_MS);
+  beat.unref?.();
+  let currentRun: RunRow | undefined;
+  try {
+    while (true) {
+      if (!heartbeat(job.documentId, job.workerId)) return;
+      if (isQueuePaused(job.ownerId)) {
+        const timestamp = now();
+        const reason = getQueueSettingsRow(getSqlite(), job.ownerId)?.pauseReason ?? "识别队列已暂停";
+        sqliteTransaction((transaction) => parkClaimedJob(transaction, job, reason, timestamp));
+        return;
+      }
+      const remaining = getSqlite().prepare(
+        "SELECT COUNT(*) AS count FROM extraction_runs WHERE document_id = ? AND status <> 'complete'",
+      ).get(job.documentId) as { count: number };
+      if (!remaining.count) {
+        await finishDocument(job);
+        return;
+      }
+      const run = nextRun(job.documentId);
+      currentRun = run;
+      if (!run) {
+        const waiting = getSqlite().prepare(
+          `SELECT MIN(next_attempt_at) AS nextAttemptAt FROM extraction_runs
+           WHERE document_id = ? AND status = 'retry_wait'`,
+        ).get(job.documentId) as { nextAttemptAt: string | null };
+        const failed = getSqlite().prepare(
+          "SELECT error FROM extraction_runs WHERE document_id = ? AND status = 'failed' ORDER BY page_number LIMIT 1",
+        ).get(job.documentId) as { error: string } | undefined;
+        const timestamp = now();
+        sqliteTransaction((transaction) => {
+          assertDocumentLease(transaction, job.documentId, job.workerId, timestamp);
+          const changed = transaction.prepare(
+            `UPDATE document_jobs SET status = ?, next_attempt_at = ?, lease_owner = NULL,
+               lease_expires_at = NULL, last_error = ?, stream_phase = ?, stream_message = ?,
+               updated_at = ?, finished_at = ?
+             WHERE document_id = ? AND lease_owner = ?`,
+          ).run(
+            failed ? "failed" : "retry_wait", waiting.nextAttemptAt,
+            failed?.error ?? null, failed ? "error" : "retry_wait",
+            failed?.error ?? "等待自动重试", timestamp, failed ? timestamp : null, job.documentId, job.workerId,
+          );
+          if (failed && changed.changes === 1) {
+            transaction.prepare("UPDATE documents SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+              .run(failed.error, timestamp, job.documentId);
+          }
+        });
+        return;
+      }
+      const document = getSqlite().prepare("SELECT name FROM documents WHERE id = ?").get(job.documentId) as { name: string };
+      const { extractDocument } = await import("../server/services/extraction");
+      const outcome = await extractDocument(job.ownerId, {
+          documentId: job.documentId,
+          fileName: document.name,
+          profileId: job.profileId ?? undefined,
+          workerId: job.workerId,
+      });
+      if (outcome.status < 400) {
+        recordQueueSuccess(job.ownerId);
+        continue;
+      }
+      const failure = outcome.body as ExtractionFailure;
+      if (failure.code === "lease_lost" || !heartbeat(job.documentId, job.workerId)) return;
+      // Some failures (for example decrypting the model credential) happen before
+      // the page run is activated, so its attempt can remain zero. The document
+      // job attempt is the durable retry clock and prevents an infinite retry loop.
+      const madeProgress = (failure.savedQuestionCount ?? 0) > 0;
+      const attempt = madeProgress ? 1 : effectiveExtractionAttempt(run.attempt, job.attempt);
+      const retryable = failure.retryable !== false && !shouldPauseExtraction(attempt);
+      const timestamp = now();
+      const message = (failure.error ?? "整卷识别失败").slice(0, 4000);
+      const circuit = sqliteTransaction((transaction) => {
+        assertDocumentLease(transaction, job.documentId, job.workerId, timestamp);
+        if (madeProgress) {
+          // Retry budget applies to the next unfinished question, not the entire paper.
+          transaction.prepare("UPDATE document_jobs SET attempt=1 WHERE document_id=?").run(job.documentId);
+          transaction.prepare("UPDATE extraction_runs SET attempt=1 WHERE document_id=? AND status<>'complete'").run(job.documentId);
+          transaction.prepare("UPDATE app_settings SET extraction_failure_streak=0 WHERE owner_id=?").run(job.ownerId);
+        }
+        if (!countsTowardExtractionCircuit(failure.code)) {
+          transaction.prepare("UPDATE app_settings SET extraction_failure_streak=0 WHERE owner_id=?").run(job.ownerId);
+          return { paused: false, reason: null };
+        }
+        const state = recordQueueFailure(transaction, job.ownerId, message, timestamp);
+        if (state.paused) parkClaimedJob(transaction, job, state.reason ?? "识别队列已暂停", timestamp);
+        return state;
+      });
+      if (circuit.paused) return;
+      if (retryable) {
+        const nextAttemptAt = futureIso(retryDelayMs(attempt, failure.retryAfterMs));
+        sqliteTransaction((transaction) => {
+          assertDocumentLease(transaction, job.documentId, job.workerId, timestamp);
+          transaction.prepare(
+            `UPDATE extraction_runs SET status = 'retry_wait', error = ?, error_code = ?,
+               next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL, finished_at = ?
+             WHERE document_id = ? AND page_number = ?`,
+          ).run(message, failure.code ?? "extraction_error", nextAttemptAt, timestamp, job.documentId, run.pageNumber);
+          transaction.prepare(
+            `UPDATE document_jobs SET status = 'retry_wait', next_attempt_at = ?, lease_owner = NULL,
+               lease_expires_at = NULL, last_error = ?, stream_phase = 'retry_wait', stream_message = ?, updated_at = ?
+             WHERE document_id = ? AND lease_owner = ?`,
+          ).run(nextAttemptAt, `整卷识别：${message}`, message, timestamp, job.documentId, job.workerId);
+          transaction.prepare("UPDATE documents SET status = 'extracting', error = ?, updated_at = ? WHERE id = ?")
+            .run(`整卷将在 ${nextAttemptAt} 自动重试：${message}`.slice(0, 4000), timestamp, job.documentId);
+        });
+      } else {
+        sqliteTransaction((transaction) => {
+          assertDocumentLease(transaction, job.documentId, job.workerId, timestamp);
+          transaction.prepare(
+            `UPDATE extraction_runs SET status = 'failed', error = ?, error_code = ?,
+               next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, finished_at = ?
+             WHERE document_id = ? AND page_number = ?`,
+          ).run(message, failure.code ?? "extraction_error", timestamp, job.documentId, run.pageNumber);
+          transaction.prepare(
+            `UPDATE document_jobs SET status = 'failed', next_attempt_at = NULL, lease_owner = NULL,
+               lease_expires_at = NULL, last_error = ?, stream_phase = 'error', stream_message = ?, finished_at = ?, updated_at = ?
+             WHERE document_id = ? AND lease_owner = ?`,
+          ).run(`整卷识别：${message}`, message, timestamp, timestamp, job.documentId, job.workerId);
+          transaction.prepare("UPDATE documents SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+            .run(`整卷识别：${message}`.slice(0, 4000), timestamp, job.documentId);
+        });
+      }
+      return;
+    }
+  } catch (error) {
+    if (error instanceof LostDocumentLeaseError || !heartbeat(job.documentId, job.workerId)) return;
+    const message = error instanceof Error ? error.message : "队列工作进程异常";
+    const timestamp = now();
+    const circuit = sqliteTransaction((transaction) => {
+      assertDocumentLease(transaction, job.documentId, job.workerId, timestamp);
+      const state = recordQueueFailure(transaction, job.ownerId, message, timestamp);
+      if (state.paused) parkClaimedJob(transaction, job, state.reason ?? "识别队列已暂停", timestamp);
+      return state;
+    });
+    if (circuit.paused) return;
+    const attempt = job.attempt;
+    const paused = shouldPauseExtraction(attempt);
+    sqliteTransaction((transaction) => {
+      assertDocumentLease(transaction, job.documentId, job.workerId, timestamp);
+      if (paused) {
+        transaction.prepare(
+          `UPDATE extraction_runs SET status = 'failed', error = ?, error_code = 'worker_error',
+             next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, finished_at = ?
+           WHERE document_id = ? AND status <> 'complete'`,
+        ).run(message.slice(0, 4000), timestamp, job.documentId);
+        transaction.prepare(
+          `UPDATE document_jobs SET status = 'failed', next_attempt_at = NULL, lease_owner = NULL,
+             lease_expires_at = NULL, last_error = ?, stream_phase = 'error', stream_message = ?, finished_at = ?, updated_at = ?
+           WHERE document_id = ? AND lease_owner = ?`,
+        ).run(message.slice(0, 4000), message.slice(0, 1000), timestamp, timestamp, job.documentId, job.workerId);
+        transaction.prepare("UPDATE documents SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+          .run(`连续 ${MAX_EXTRACTION_ATTEMPTS} 次处理失败，任务已暂停：${message}`.slice(0, 4000), timestamp, job.documentId);
+      } else {
+        const nextAttemptAt = futureIso(retryDelayMs(attempt));
+        if (currentRun) {
+          transaction.prepare(
+            `UPDATE extraction_runs SET status = 'retry_wait', error = ?, error_code = 'worker_error',
+               next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL, finished_at = ?
+             WHERE id = ? AND status <> 'complete'`,
+          ).run(message.slice(0, 4000), nextAttemptAt, timestamp, currentRun.id);
+        }
+        transaction.prepare(
+          `UPDATE document_jobs SET status = 'retry_wait', next_attempt_at = ?, lease_owner = NULL,
+             lease_expires_at = NULL, last_error = ?, stream_phase = 'retry_wait', stream_message = ?, updated_at = ?
+           WHERE document_id = ? AND lease_owner = ?`,
+        ).run(nextAttemptAt, message.slice(0, 4000), message.slice(0, 1000), timestamp, job.documentId, job.workerId);
+        transaction.prepare("UPDATE documents SET status = 'extracting', error = ?, updated_at = ? WHERE id = ?")
+          .run(`处理异常，将在 ${nextAttemptAt} 自动重试：${message}`.slice(0, 4000), timestamp, job.documentId);
+      }
+    });
+  } finally {
+    clearInterval(beat);
+  }
+}
+
+async function pump() {
+  await ensureDatabase();
+  const jobs = claimJobs();
+  if (jobs.length) {
+    for (const job of jobs) {
+      void processJob(job).finally(() => schedulePump(25));
+    }
+    return;
+  }
+  const next = getSqlite().prepare(
+    `SELECT MIN(next_attempt_at) AS nextAttemptAt FROM document_jobs
+     WHERE status = 'retry_wait' AND next_attempt_at IS NOT NULL`,
+  ).get() as { nextAttemptAt: string | null };
+  const lease = getSqlite().prepare(
+    `SELECT MIN(lease_expires_at) AS leaseExpiresAt FROM document_jobs
+     WHERE status = 'processing' AND lease_expires_at IS NOT NULL`,
+  ).get() as { leaseExpiresAt: string | null };
+  const queued = getSqlite().prepare(
+    "SELECT COUNT(*) AS count FROM document_jobs WHERE status = 'queued'",
+  ).get() as { count: number };
+  if (queued.count) schedulePump(1000);
+  else {
+    const wakeTimes = [next.nextAttemptAt, lease.leaseExpiresAt].filter(Boolean).map((value) => Date.parse(value!));
+    if (wakeTimes.length) schedulePump(Math.min(30_000, Math.max(25, Math.min(...wakeTimes) - Date.now())));
+  }
+}
+
+export async function kickExtractionQueue() {
+  if (process.env.JIANTI_PROCESS_ROLE !== "worker" && process.env.JIANTI_EMBEDDED_WORKER !== "1") return;
+  if (global.__teacherDbQueuePump) return global.__teacherDbQueuePump;
+  global.__teacherDbQueuePump = pump().finally(() => {
+    global.__teacherDbQueuePump = undefined;
+  });
+  return global.__teacherDbQueuePump;
+}
