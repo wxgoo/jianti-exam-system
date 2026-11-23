@@ -92,7 +92,7 @@ export function PaperPages({ className, variables, header, binding, blocks, foot
       <div className="paper-page-body">
         <div className="paper-measure-header">{header}</div>
         <div className="paper-measure-gap" />
-        {blocks.map(block => <div className="paper-measure-block" key={block.id} style={{ width: block.answer || columns === 1 ? "100%" : "calc((100% - 10mm) / 2)" }}>
+        {blocks.map(block => <div className="paper-measure-block" key={block.id} style={{ width: columns === 1 ? "100%" : `calc((100% - 10mm) / ${columns})` }}>
           <div className="paper-heading-wrap">{block.heading}</div>
           <div className="paper-question-content">{block.content}</div>
         </div>)}
@@ -106,7 +106,6 @@ export function PaperPages({ className, variables, header, binding, blocks, foot
           <div className="paper-page-columns" style={{ gridTemplateColumns: `repeat(${page.columns.length}, minmax(0, 1fr))` }}>
             {page.columns.map((items, column) => <div key={column}>{items.map(renderItem)}</div>)}
           </div>
-          {page.answers && <div className="paper-page-answers">{page.answers.map(renderItem)}</div>}
         </div>
         {footer(pageIndex + 1)}
       </article>)}

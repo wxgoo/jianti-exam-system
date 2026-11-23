@@ -2,87 +2,90 @@ export type MeasuredPaperBlock = {
   sectionId: string;
   contentHeight: number;
   headingHeight: number;
+  /** 需要书写空白（综合题 / 答题卡） */
   answer: boolean;
   minimumBlank: number;
 };
 
 export type PaperPageItem = { index: number; heading: boolean; blank: number; continuation?: boolean };
-export type PaperPageLayout = { header: boolean; columns: PaperPageItem[][]; answers?: PaperPageItem[] };
+export type PaperPageLayout = { header: boolean; columns: PaperPageItem[][] };
 
-/** All dimensions are CSS pixels measured at the actual paper width, after fonts/images load. */
+/** 所有尺寸是加载完字体和图片后在实际 paper 宽度下测量出来的 CSS pixel。 */
 export function paginatePaper(blocks: MeasuredPaperBlock[], pageHeight: number, headerHeight: number, gap: number, columnCount = 1) {
   const pages: PaperPageLayout[] = [];
-  let answerPage = blocks[0]?.answer ?? false;
-  let page: PaperPageLayout = { header: true, columns: Array.from({ length: answerPage ? 1 : columnCount }, () => []) };
+  let page: PaperPageLayout = { header: true, columns: Array.from({ length: columnCount }, () => []) };
   pages.push(page);
   let column = 0;
   let used = headerHeight;
   let columnHeights = page.columns.map(() => headerHeight);
   let previousSection = "";
-  const newPage = (answer: boolean) => {
-    answerPage = answer;
-    page = { header: false, columns: Array.from({ length: answer ? 1 : columnCount }, () => []) };
+  const newPage = () => {
+    page = { header: false, columns: Array.from({ length: columnCount }, () => []) };
     pages.push(page);
     column = 0;
     used = 0;
     columnHeights = page.columns.map(() => 0);
     previousSection = "";
   };
-  const advance = (answer: boolean) => {
-    if (!answer && answer === answerPage && column + 1 < page.columns.length) {
+  const advance = () => {
+    if (column + 1 < page.columns.length) {
       column += 1;
       used = page.header ? headerHeight : 0;
       previousSection = "";
-    } else newPage(answer);
+    } else newPage();
   };
-  const currentItems = () => page.answers ?? page.columns[column];
+  const currentItems = () => page.columns[column];
+
   blocks.forEach((block, index) => {
-    if (block.answer !== answerPage) {
-      if (block.answer) {
-        // Reuse the remaining full-width space below the tallest objective column.
-        used = Math.max(...columnHeights);
-        if (page.columns.length > 1) page.answers = [];
-        answerPage = true;
-        previousSection = "";
-      } else newPage(false);
-    }
     let heading = previousSection !== block.sectionId;
     const size = () => {
       const headingHeight = heading ? block.headingHeight : 0;
       // 答题卡书写空白自适应：小题 12% 页高，大题最多 25% 页高。
-      // 旧设计硬塞 pageHeight/2（半页），导致综合题一道题吃掉一页。
-      // 多道综合题答题卡改为 25% 上限后，一页可排 3-4 道。
+      // 模板列数（columnCount）由用户在排版设置里定，
+      // 这里不再因为 block.answer=true 就强制切到单列全宽区域——
+      // 综合题在 A3 双栏模板下也双栏排版。
       const blank = block.answer
         ? Math.min(pageHeight * 0.25, Math.max(pageHeight * 0.12, block.minimumBlank))
         : 0;
       return { blank, height: headingHeight + block.contentHeight + blank + (block.answer ? 0 : gap) };
     };
     let dimensions = size();
-    if (used + dimensions.height > pageHeight + 0.5 && (currentItems().length || (block.answer && page.columns.some(items => items.length)))) {
-      advance(block.answer);
+
+    // 当前栏放不下 → 跳下一栏；栏已完则新页
+    if (used + dimensions.height > pageHeight + 0.5 && currentItems().length) {
+      advance();
       heading = true;
       dimensions = size();
     }
-    // Preserve the required writing area when a long question needs a continuation.
+    // 第一页头部以下的长题目，也需要新页
     if (used + dimensions.height > pageHeight + 0.5 && page.header && headerHeight > 0 && block.contentHeight + (heading ? block.headingHeight : 0) > pageHeight - used) {
-      newPage(block.answer);
+      newPage();
       heading = true;
       dimensions = size();
     }
+
     const promptHeight = block.contentHeight + (heading ? block.headingHeight : 0);
     const blank = block.answer ? Math.min(dimensions.blank, Math.max(0, pageHeight - used - promptHeight)) : 0;
     currentItems().push({ index, heading, blank });
     used += promptHeight + blank + (block.answer ? 0 : gap);
-    if (!page.answers) columnHeights[column] = used;
+    columnHeights[column] = used;
     previousSection = block.sectionId;
+
+    // 答题卡续页（剩余空白跨页）
     let remainingBlank = Math.max(0, dimensions.blank - blank);
     while (remainingBlank > 0.5) {
-      newPage(true);
+      // 同一题的续页 → 跟随当前模板列数，不再强制单列
+      const nextPage = { header: false, columns: Array.from({ length: columnCount }, () => []) } as PaperPageLayout;
+      pages.push(nextPage);
       const part = Math.min(remainingBlank, pageHeight - 28);
-      page.columns[0].push({ index, heading: false, blank: part, continuation: true });
+      nextPage.columns[0].push({ index, heading: false, blank: part, continuation: true });
+      column = 0;
       used = part + 28;
+      columnHeights = nextPage.columns.map(() => 0);
+      columnHeights[0] = used;
       previousSection = block.sectionId;
       remainingBlank -= part;
+      page = nextPage;
     }
   });
   return pages;
