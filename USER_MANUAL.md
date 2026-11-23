@@ -468,7 +468,7 @@ Word 导入识别规则（与参考工具「江苏小学练习生成器」一致
 - `versionCode`：卷别（A/B/C...，用于 A-B 卷）
 - `seed`：随机种子，相同 seed 生成相同题目顺序
 
-#### 6.3.3 A-B 卷
+#### 6.4.3 A-B 卷
 
 使用相同的 `seed` 和不同的 `versionCode`，可生成题目顺序相同但卷别不同的 A-B 卷，适用于考试防抄。
 
@@ -492,34 +492,40 @@ Word 导入识别规则（与参考工具「江苏小学练习生成器」一致
 
 ### 6.6 学生练习与考试
 
-#### 6.5.1 练习模式
+#### 6.6.1 练习模式
 
 **路径**：`/practice`
 
 1. 选择一份已生成的试卷
 2. 点击「开始练习」
-3. 作答题目（单选/多选/填空）
+3. 作答题目（单选/多选/填空/解答）
 4. 提交答案，系统自动判分并显示得分
 5. 错题自动记入错题本
 
-#### 6.5.2 考试模式
+#### 6.6.2 考试模式
 
-**路径**：`/practice/exam`
+**入口（任选其一）**：
+- 组卷页顶栏「**▶️ 进入练习**」按钮（保存后自动激活）
+- 试卷库 `/papers` 组卷作品卡片下拉菜单 →「进入练习」
+- 直接访问 `/practice/exam`
 
-1. 选择试卷，设置考试时长（分钟）
-2. 点击「开始考试」
-3. 页面显示倒计时，时间到自动交卷
-4. 提交后锁定，禁止重复提交
-5. 查看考试结果和错题
+**流程**：
+1. 选试卷 → 设考试时长（1–180 分钟，默认 60）→ 点「开始考试」
+2. 后端创建练习会话 → 跳 `/practice/[sessionId]` → 页面显示倒计时
+3. 时间到自动交卷；手动点「提交答案」也可
+4. 提交后锁定，禁止重复提交；错题自动记入错题本
 
-考试模式特点：
-- 带计时器，倒计时到 0 自动交卷
-- 提交后会话状态变为 `submitted`，禁止再次提交
-- 自动判分，解答题暂不计分（需人工批改）
+**技术链路**：
+```
+POST /api/practice/sessions { paperId, type:"exam", durationMinutes } → 201 { sessionId, questions[] }
+GET  /api/practice/:sessionId → { session, questions[] }
+POST /api/practice/:sessionId/answers { answers: [{ questionId, answer }] } → 判分 + 记入错题本
+PATCH/DELETE /api/practice/:sessionId → 更新状态 / 删除会话
+```
 
 ### 6.7 错题本与错题复习
 
-#### 6.6.1 错题本
+#### 6.7.1 错题本
 
 **路径**：`/wrong-book`
 
@@ -532,7 +538,7 @@ Word 导入识别规则（与参考工具「江苏小学练习生成器」一致
 
 错题自动来源：学生在练习/考试中答错的题目会自动写入错题本。
 
-#### 6.6.2 错题复习
+#### 6.7.2 错题复习
 
 **路径**：`/wrong-book/review`
 
@@ -790,9 +796,29 @@ taskkill /F /IM node.exe
 
 **解决**：系统使用 temml → MathML → OMML 管线，已验证常见公式（frac/sum/int/cases/angle/dfrac/degree/overparen/aligned/text/matrix/blank）。如遇特定公式失败，系统会回退显示源码。
 
+### 9.9 练习页加载会话失败
+
+**现象**：组卷页点「▶️ 进入练习」→ `/practice/exam/[paperId]/start` → 设时长 → 开始考试 → 跳转 `/practice/[sessionId]` → 显示「加载会话失败」。
+
+**原因**：Next.js 16 App Router 里 **Client Component**（`"use client"`）不能用 Server Component 的 `({ params }: { params: { sessionId: string } })` 签名拿动态路由段——函数参数解构拿到的是 `undefined`，必须用 `useParams()` hook。
+
+**排查**：DevTools Console 搜 `GET /api/practice/undefined` 或 Network tab 看 URL，如果 sessionId 那段是字面量 `undefined` 就是这个坑。
+
+**解决**：所有 `"use client"` 页面统一改为：
+```tsx
+import { useParams } from "next/navigation";
+export default function PracticeSessionPage() {
+  const params = useParams<{ sessionId: string }>();
+  const sessionId = params?.sessionId ?? "";
+  // ...
+}
+```
+
+> ⚠️ Next.js 16 App Router 只有 Server Component 才能用 `({ params })` 解构。项目里所有需要动态路由段的 Client Component 页面都已审计修复（`/practice/exam/[paperId]/start`、`/practice/[sessionId]`）。
+
 ---
 
-### 9.9 题库 / 组卷 / 审核全空
+### 9.10 题库 / 组卷 / 审核全空
 
 **现象**：登录后题库页显示 0 道题，组卷下拉选不到试卷，审核页面没内容。
 
