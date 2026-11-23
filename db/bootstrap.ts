@@ -723,6 +723,29 @@ function initialize() {
   initialized = true;
 }
 
+/** 首个 admin 种子用户，空库时自动创建 */
+function seedDefaultAdmin() {
+  const sqlite = getSqlite();
+  const count = sqlite.prepare("SELECT COUNT(*) AS c FROM teachers").get({}) as { c: number };
+  if (count.c > 0) return;
+  const { randomUUID } = require("node:crypto");
+  // 避免 db/bootstrap.ts → lib/auth.ts 循环引用，这里 inline hashPassword
+  const { createHmac, randomBytes } = require("node:crypto");
+  const hashPassword = (password: string) => {
+    const salt = randomBytes(16).toString("hex");
+    const hash = createHmac("sha256", salt).update(password).digest("hex");
+    return `${salt}:${hash}`;
+  };
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  sqlite.prepare(
+    `INSERT INTO teachers (id, username, password_hash, name, school, subject, role, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'admin', ?)`,
+  ).run(id, "admin", hashPassword("admin123"), "系统管理员", "系统", "通用", now);
+  console.log("[bootstrap] seeded default admin (admin/admin123)");
+}
+
 export async function ensureDatabase() {
   if (!initialized) initialize();
+  seedDefaultAdmin();
 }
