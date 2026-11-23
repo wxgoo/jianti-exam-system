@@ -210,6 +210,23 @@ export function PaperBuilder({ questions, initialIds, templates: initialTemplate
     if (await saveTemplate()) setTemplateStudioOpen(false);
   }
 
+  async function deleteTemplate(id: string) {
+    if (!confirm("确定删除该模板？此操作不可恢复。")) return;
+    try {
+      const response = await fetch(`/api/paper-templates?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!response.ok) { setTemplateMessage((await response.json().catch(() => ({})) as { error?: string }).error ?? "删除失败"); return; }
+      setTemplates((items) => items.filter((t) => t.id !== id));
+      if (templateId === id) {
+        const fallback = initialTemplates[0];
+        setTemplateId(fallback.id);
+        applyTemplate(fallback.id);
+      }
+      setTemplateMessage("模板已删除");
+    } catch {
+      setTemplateMessage("网络异常，删除失败");
+    }
+  }
+
   const downloadFormats = {
     pdf: { path: "pdf", label: "PDF", failure: "PDF 生成失败" },
     docx: { path: "docx", label: "Word", failure: "Word 生成失败" },
@@ -250,7 +267,7 @@ export function PaperBuilder({ questions, initialIds, templates: initialTemplate
       <div className="paper-workspace">
         <aside className="paper-settings no-print">
           <div className="section-title"><div><h2>试卷模板与版式</h2><p>板块、分值、题图均可调整</p></div><Settings2 size={17} /></div>
-          <label className="edit-field"><span>套用模板</span><select value={templateId} onChange={(event) => applyTemplate(event.target.value)}>{availableTemplates.map((template) => <option key={template.id} value={template.id}>{template.name}{template.isPreset ? " · 预制" : " · 我的"}</option>)}</select></label>
+          <label className="edit-field"><span>套用模板</span><div className="template-select-row"><select value={templateId} onChange={(event) => applyTemplate(event.target.value)}>{availableTemplates.map((template) => <option key={template.id} value={template.id}>{template.name}{template.isPreset ? " · 预制" : " · 我的"}</option>)}</select>{templates.find((t) => t.id === templateId && t.isPreset === false) && <button type="button" className="icon-btn template-delete" title="删除该模板" onClick={() => deleteTemplate(templateId)}><Trash2 size={14} /></button>}</div></label>
           <label className="edit-field"><span>试卷标题</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
           <label className="edit-field"><span>副标题</span><input value={subtitle} onChange={(event) => setSubtitle(event.target.value)} /></label>
           <button type="button" className={`template-studio-trigger${templateStudioOpen ? " active" : ""}`} aria-expanded={templateStudioOpen} onClick={openTemplateStudio}><span><LayoutTemplate size={17} /><i><strong>模板排版设置</strong><small>偶尔调整一次，保存后持续复用</small></i></span><ChevronRight size={15} /></button>

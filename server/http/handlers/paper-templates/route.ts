@@ -68,3 +68,16 @@ export async function POST(request: Request) {
   }
   return Response.json({ id, templates: await getPaperTemplates(ownerId, subject, payload.stage) }, { status: existing ? 200 : 201 });
 }
+
+export async function DELETE(request: Request) {
+  const url = new URL(request.url);
+  const id = url.searchParams.get("id")?.trim();
+  if (!id || id.length > 100) return Response.json({ error: "模板 id 无效" }, { status: 400 });
+  await ensureDatabase();
+  const ownerId = requestOwner(request);
+  const row = getSqlite().prepare("SELECT id, kind FROM paper_templates WHERE id = ?").get(id) as { id: string; kind: string } | undefined;
+  if (!row) return Response.json({ error: "模板不存在" }, { status: 404 });
+  if (row.kind !== "custom") return Response.json({ error: "预制模板不可删除" }, { status: 400 });
+  getSqlite().prepare("DELETE FROM paper_templates WHERE id = ? AND owner_id = ?").run(id, ownerId);
+  return Response.json({ ok: true });
+}
