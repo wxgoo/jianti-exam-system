@@ -371,10 +371,14 @@ Word 导入识别规则（与参考工具「江苏小学练习生成器」一致
 
 - 入口：`http://localhost:3050/register`（注册）、`http://localhost:3050/login`（登录）
 - 注册字段：用户名、密码（至少 6 位）、姓名、学校、学科
-- 第一个注册者自动成为 `admin`，其余为 `teacher`
+- **空库首次启动时系统自动创建 `admin / admin123`**（role=admin，无需手动注册；代码见 `db/bootstrap.ts → seedDefaultAdmin()`）
+- 后续通过 `/register` 注册的账号一律为 `teacher` 角色
+- admin 角色特权：不受前端 subject/stage 过滤，打开全库所有学段/科目的题目与试卷；teacher 只能看到自己学科范围内的数据
 - 注册成功后自动登录（`set-cookie`）
 - 重复用户名注册会返回 409
 - 登录错误密码返回 401
+
+> 💡 部署后先用 `admin / admin123` 登录验证，再按需创建教师账号。首次登录后建议立刻改掉默认密码。
 
 #### 6.3.2 账号属性
 
@@ -769,6 +773,37 @@ taskkill /F /IM node.exe
 **原因**：OMML 注入失败，或 Word 版本不支持 MathML。
 
 **解决**：系统使用 temml → MathML → OMML 管线，已验证常见公式（frac/sum/int/cases/angle/dfrac/degree/overparen/aligned/text/matrix/blank）。如遇特定公式失败，系统会回退显示源码。
+
+---
+
+### 9.9 题库 / 组卷 / 审核全空
+
+**现象**：登录后题库页显示 0 道题，组卷下拉选不到试卷，审核页面没内容。
+
+**原因**：本地部署的多租户 owner 关联没对齐。新注册的 admin teacherId 和旧 `local-demo` tenantId 不一致，数据落在旧 owner 下被过滤掉了。
+
+**排查步骤**：
+
+```powershell
+cd jianti-exam-system
+node -e "
+const {Database}=require('better-sqlite3');
+const db=new Database('data/teacher-question-bank.sqlite3');
+console.log('teachers:', db.prepare('select id,username,role from teachers').all());
+console.log('docs:', db.prepare('select id,owner_id,status,subject from documents').all());
+console.log('q total:', db.prepare('select count(*) from questions').get()['count(*)']);
+"
+```
+
+**解决**（一条 SQL 把数据归到当前 admin）：
+
+```sql
+UPDATE documents SET owner_id = '<当前 admin 的 teacherId>' WHERE owner_id != '<当前 admin 的 teacherId>';
+UPDATE documents SET status = 'ready' WHERE status = 'reviewing' 
+  AND (SELECT COUNT(*) FROM questions WHERE document_id = documents.id) > 0;
+```
+
+admin 角色还会绕过 subject/stage 过滤（普通 teacher 只看到自己学科的数据）。
 
 ---
 
