@@ -3,7 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useRef, useState, type RefObject } from "react";
-import { BookOpen, Check, ChevronRight, Download, FlaskConical, Search, Sparkles, Upload } from "lucide-react";
+import { BookOpen, Check, ChevronRight, Download, FlaskConical, Search, Sparkles, Trash2, Upload } from "lucide-react";
 import { subjects } from "../lib/education-taxonomy";
 import { builtInTeachingSkill, skillGrades } from "../lib/teaching-skill-catalog";
 import type { SkillTrial, TeachingSkill } from "../lib/teaching-skill-store";
@@ -90,6 +90,14 @@ function SkillWorkbench({ subject, grade, canLeaveRef }: { subject: string; grad
     catch (error) { setError(error instanceof Error ? error.message : "操作失败"); }
     finally { setBusy(""); }
   }
+  async function deleteSkill(id: string, name: string) {
+    if (!window.confirm(`确定删除识别方案"${name}"？`)) return;
+    await action("删除方案中…", async () => {
+      await requestJson(`/api/teaching-skills/${id}`, { method: "DELETE" });
+      setSkills(items => items.filter(s => s.id !== id));
+      if (selected?.id === id) { setSelected(null); setView("home"); }
+    });
+  }
   async function mutate(operation: string, extra: Record<string, unknown> = {}) {
     if (!selected) return;
     await action(operation === "trial" ? "试识别与模型复核中…" : operation === "refine" ? "根据复核意见改进 Skill…" : "保存中…", async () => {
@@ -112,7 +120,7 @@ function SkillWorkbench({ subject, grade, canLeaveRef }: { subject: string; grad
     {view === "home" && <>
       <section className="skill-card skill-default-card"><span className="skill-scheme-icon" aria-hidden="true"><BookOpen size={22} strokeWidth={1.7} /></span><div><h2>默认识别方案<span className="resource-badge">系统内置</span></h2><p>{grade} · {subject} · 默认规则始终生效，个人方案补充你的识别偏好。</p></div><button className="btn" onClick={() => navigate("default")}>查看默认规则<ChevronRight size={14} /></button></section>
       <section className="skill-card skill-personal-card"><header><div><h2>我的识别方案<span className="skill-count">{skills.length}</span></h2><p>上传样例生成方案，核对效果后启用。</p></div><label className="skill-search"><Search size={16} /><input aria-label="搜索识别方案" placeholder="搜索方案名称…" value={search} onChange={event => setSearch(event.target.value)} /></label></header>
-        {loading ? <p role="status">正在读取识别方案…</p> : error ? <p role="alert">{error}</p> : !skills.length ? <div className="skill-empty"><h3>从一份常用试卷开始</h3><p>上传样例图片 → AI 生成候选规则 → 试识别与人工核对 → 启用并复用</p><button className="btn" onClick={() => navigate("create")}>上传样例创建 Skill</button></div> : <div className="skill-catalog">{skills.filter(skill => skill.name.includes(search.trim())).map(skill => <article key={skill.id}><span className="skill-scheme-icon personal" aria-hidden="true"><Sparkles size={21} strokeWidth={1.7} /></span><div className="skill-catalog-info"><strong>{skill.name}</strong><p>{skill.grade} · {skill.subject} · v{skill.revision} · 更新于 {new Date(skill.updatedAt).toLocaleDateString("zh-CN")}</p></div><span className={`resource-badge skill-state${skill.active ? " active" : ""}`}><i />{skill.active ? "已启用" : "未启用"}</span><button className="btn" disabled={!!busy} onClick={() => void action("读取方案…", async () => { await refresh(skill.id); setView("detail"); setTab("overview"); })}>查看与编辑<ChevronRight size={14} /></button></article>)}{!skills.some(skill => skill.name.includes(search.trim())) && <p>没有匹配的方案，请调整搜索。</p>}</div>}
+        {loading ? <p role="status">正在读取识别方案…</p> : error ? <p role="alert">{error}</p> : !skills.length ? <div className="skill-empty"><h3>从一份常用试卷开始</h3><p>上传样例图片 → AI 生成候选规则 → 试识别与人工核对 → 启用并复用</p><button className="btn" onClick={() => navigate("create")}>上传样例创建 Skill</button></div> : <div className="skill-catalog">{skills.filter(skill => skill.name.includes(search.trim())).map(skill => <article key={skill.id}><span className="skill-scheme-icon personal" aria-hidden="true"><Sparkles size={21} strokeWidth={1.7} /></span><div className="skill-catalog-info"><strong>{skill.name}</strong><p>{skill.grade} · {skill.subject} · v{skill.revision} · 更新于 {new Date(skill.updatedAt).toLocaleDateString("zh-CN")}</p></div><span className={`resource-badge skill-state${skill.active ? " active" : ""}`}><i />{skill.active ? "已启用" : "未启用"}</span><button className="btn" disabled={!!busy} onClick={() => void action("读取方案…", async () => { await refresh(skill.id); setView("detail"); setTab("overview"); })}>查看与编辑<ChevronRight size={14} /></button><button type="button" className="icon-btn skill-delete-btn" title="删除方案" disabled={!!busy} onClick={() => void deleteSkill(skill.id, skill.name)}><Trash2 size={14} /></button></article>)}{!skills.some(skill => skill.name.includes(search.trim())) && <p>没有匹配的方案，请调整搜索。</p>}</div>}
       </section>
     </>}
     {view === "default" && <>

@@ -1,6 +1,6 @@
 import { readJsonPayload } from "../../../../../lib/request-payload";
 import { requestOwner } from "../../../../../lib/server";
-import { getAssignmentDetail, setAssignmentStatus } from "../../../../../lib/school-workflow";
+import { deleteAssignment, getAssignmentDetail, setAssignmentStatus } from "../../../../../lib/school-workflow";
 
 
 export async function GET(request: Request, context: { params: Promise<{ assignmentId: string }> }) {
@@ -19,5 +19,13 @@ export async function PATCH(request: Request, context: { params: Promise<{ assig
     return Response.json(await setAssignmentStatus(requestOwner(request), (await context.params).assignmentId, parsed.value.status));
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "更新作业失败" }, { status: 400 });
+  }
+}
+
+export async function DELETE(request: Request, context: { params: Promise<{ assignmentId: string }> }) {
+  try {
+    return Response.json(await deleteAssignment(requestOwner(request), (await context.params).assignmentId));
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : "删除作业失败" }, { status: 400 });
   }
 }

@@ -34,3 +34,14 @@ export async function POST(request: Request) {
   ).run(crypto.randomUUID(), requestOwner(request), subject, stage, name, now());
   return Response.json({ tags: await getTagCatalog(requestOwner(request), subject, stage) }, { status: 201 });
 }
+
+export async function DELETE(request: Request) {
+  const url = new URL(request.url);
+  const id = url.searchParams.get("id")?.trim();
+  if (!id || id.length > 100) return Response.json({ error: "标签 id 无效" }, { status: 400 });
+  await ensureDatabase();
+  const ownerId = requestOwner(request);
+  const result = getSqlite().prepare("DELETE FROM tag_catalog WHERE id = ? AND owner_id = ?").run(id, ownerId);
+  if (!result.changes) return Response.json({ error: "标签不存在" }, { status: 404 });
+  return Response.json({ ok: true });
+}

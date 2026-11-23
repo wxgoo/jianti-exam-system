@@ -267,6 +267,26 @@ export async function setAssignmentStatus(ownerId: string, assignmentId: string,
   return { status };
 }
 
+export async function deleteAssignment(ownerId: string, assignmentId: string) {
+  await ensureDatabase();
+  const db = getSqlite();
+  const row = db.prepare("SELECT id FROM assignments WHERE id = ? AND owner_id = ?").get(assignmentId, ownerId);
+  if (!row) throw new Error("作业不存在");
+  db.prepare("DELETE FROM assignment_submissions WHERE assignment_id = ?").run(assignmentId);
+  db.prepare("DELETE FROM assignments WHERE id = ?").run(assignmentId);
+  return { ok: true };
+}
+
+export async function deleteTeachingClass(ownerId: string, classId: string) {
+  await ensureDatabase();
+  const db = getSqlite();
+  const row = db.prepare("SELECT id FROM teaching_classes WHERE id = ? AND owner_id = ?").get(classId, ownerId);
+  if (!row) throw new Error("班级不存在");
+  db.prepare("DELETE FROM class_students WHERE class_id = ?").run(classId);
+  db.prepare("DELETE FROM teaching_classes WHERE id = ?").run(classId);
+  return { ok: true };
+}
+
 export async function updateTeachingClass(ownerId: string, classId: string, input: { name?: unknown; grade?: unknown; subject?: unknown; schoolYear?: unknown; archived?: unknown }) {
   await ensureDatabase();
   return sqliteTransaction((sqlite) => {

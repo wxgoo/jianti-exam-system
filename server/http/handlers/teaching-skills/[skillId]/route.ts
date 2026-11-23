@@ -47,3 +47,14 @@ export async function PATCH(request: Request, context: Context) {
     return Response.json({ skill: ownedSkill(db, ownerId, skill.id), trials: skillTrials(db, skill.id) });
   } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "操作失败" }, { status: 400 }); }
 }
+
+export async function DELETE(request: Request, context: Context) {
+  await ensureDatabase();
+  const db = getSqlite();
+  const ownerId = requestOwner(request);
+  const skillId = (await context.params).skillId;
+  try { ownedSkill(db, ownerId, skillId); } catch { return Response.json({ error: "Skill 不存在" }, { status: 404 }); }
+  db.prepare("DELETE FROM skill_trials WHERE skill_id = ?").run(skillId);
+  db.prepare("DELETE FROM teaching_skills WHERE id = ? AND owner_id = ?").run(skillId, ownerId);
+  return Response.json({ ok: true });
+}
