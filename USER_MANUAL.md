@@ -316,16 +316,49 @@ Word 导入识别规则（与参考工具「江苏小学练习生成器」一致
 
 ### 6.2.2 找题 / 下载试卷（外部题库）
 
-**路径**：`/bank` 顶部「找题 / 下载」按钮。
+**路径**：`/bank` 顶部「🔍 找题 / 下载」按钮，弹窗分两个 Tab。
 
-本系统**不自动抓取任何外部网站**，只提供跳转和本地导入：
+弹窗顶部有一条**解压后端状态条**，绿色代表后端 RAR 自动入库已就绪（容器部署开箱即用），黄色代表需手动装解压工具。详见下文「解压后端」。
 
-- **第一试卷网**：选择科目、年级后打开对应栏目搜索页；下载得到 `.rar`，请在本机解压后，用「导入试卷」上传其中的 Word（.docx）或 PDF。
-- **组卷网 / 学科网组卷**：打开对应站点，安装油猴脚本 `zxxk-zujuan-export.user.js` 后，在当前页面导出「题目离线 HTML / 题目 ZIP / 答案合集 HTML / 答案 ZIP」；回到本系统，在「找题 / 下载」弹窗中选择导出文件并导入。
-- 导出包解析支持按 QID 卡片去重、从 `答:` 与 `.ans` 区块提取答案和解析；图片不会自动导入，会在结果中提示数量，需在审核页人工核对。
-- 重复文件按校验和拦截，不会生成重复题目；导入后仍要逐题审核、确认入库，才能进入题库。
+---
 
-> 请尊重外部站点服务条款与试卷版权，仅将本功能用于个人学习、备课和归档；不要用于批量抓取或商业分发。
+#### Tab 1 · 第一试卷网（自动搜索 / 自动入库）
+
+| 功能 | 说明 |
+|---|---|
+| 搜索 | 弹窗内直接选科目（9 门）+ 年级（14 个）+ 可选版本关键词（如「人教版」），后端实时抓取 `www.shijuan1.com` 栏目页并展示匹配列表 |
+| 自动入库 | 点每行右侧「自动入库」→ 后端下载 .rar → **自动解压** → 挑出 .docx → 解析 → 入库。弹窗内直接展示「成功/跳过的文件清单」 |
+| 仅下载 | 经典模式：浏览器保存 .rar 到本机，解压后用「导入试卷」上传 |
+
+**注意**：
+- 第一试卷网大多数试卷用旧版 `.doc`，后端目前只解析 `.docx`。结果里会明确提示 `.doc` 文件需手动用 Word/WPS 另存为 `.docx` 再上传
+- 解压后端缺失时「自动入库」按钮自动禁用，状态条告诉你怎么装
+- 下载的 .rar 里若含 `.pdf`，会提示 PDF 需 OCR 流程（单独功能）
+
+#### Tab 2 · 组卷网 / 学科网（油猴脚本导出导入）
+
+本系统**不自动抓取**组卷网/学科网，走浏览器端导出路径：
+
+1. 打开对应站点，安装油猴脚本 `zxxk-zujuan-export.user.js`
+2. 在当前页面导出：题目离线 HTML / 题目 ZIP / 答案合集 HTML / 答案 ZIP
+3. 回到本系统「找题 / 下载」弹窗，选导出文件直接导入
+
+解析特性：QID 卡片去重、`答:` / `.ans` 区块提取答案与解析、重复文件按校验和拦截；图片不自动导入，结果里提示数量需人工核对。
+
+> ⚠️ 请尊重外部站点服务条款与试卷版权，仅将本功能用于个人学习、备课和归档；不要用于批量抓取或商业分发。
+
+---
+
+#### 解压后端（RAR 自动入库必需）
+
+| 部署环境 | 就绪状态 | 说明 |
+|---|---|---|
+| **Docker 容器** | ✅ 绿状态，开箱即用 | 镜像已预装 `unrar` + `p7zip-full` + Python `rarfile` |
+| **Windows 开发机** | ⚠️ 需手动装 | 安装 **7-Zip** (https://www.7-zip.org) 或 **WinRAR** 并加入 PATH；或运行 `winget install -e --id=7zip.7zip` |
+| **Linux 服务器** | 视环境 | 推荐走 Docker 容器部署，自动具备 |
+| **NAS 群晖/威联通** | ✅ 同 Docker | ghcr.io 镜像内已装 unrar |
+
+后端探测链：`unrar → unar → 7z → bsdtar → rarfile(Python)`，自动挑选第一个真正可用的后端。可通过「弹窗顶部状态条」或 `GET /api/sources/shijuan1?action=archive-backends` 查看。
 
 ### 6.3 教师账号与多租户账号系统
 
@@ -863,54 +896,114 @@ jianti-exam-system/
 
 与 [5.1](#51-windows-一键启动)（前台启动，需保持窗口打开）的区别：11.1 是完整部署——安装、构建、后台启动、健康检查，脚本结束时服务继续运行。
 
-### 11.2 群晋 NAS 部署
+### 11.2 群晋 NAS 部署（推荐：直接拉 ghcr.io 预构建镜像）
 
-文件清单（放在项目根目录 `deploy/nas/` 下）：
+**方式 A（推荐）· 从 GitHub Container Registry 拉镜像，免本机构建**
 
-- `Dockerfile` — 基于 `node:22` 的镜像（构建上下文为项目根目录，`COPY . .` 包含源码与 `.next` 构建产物），预置 gcc/make/python3 编译 better-sqlite3
-- `docker-compose.yml` — 服务定义（端口 3050/3051、`jianti_data` 卷、`unless-stopped` 重启策略）
+```bash
+mkdir -p /volume1/docker/jianti && cd /volume1/docker/jianti
+# 下载现成的 compose 文件（已配好 ghcr.io 镜像）
+curl -o docker-compose.yml \
+  https://raw.githubusercontent.com/wxgoo/jianti-exam-system/main/deploy/nas/docker-compose.yml
 
-步骤：
+# 唯一要改的：APP_BASE_URL=http://<群晋IP>:3050
+docker compose pull
+docker compose up -d
+```
 
-1. 在 NAS 上上传/克隆项目（保证 `jianti-exam-system/` 根目录完整）。
-2. 在群晋终端执行（或在群晋 Docker 管理器中导入该 compose）：
+首次启动约 2 分钟（拉镜像 500 MB 左右）。**解压后端已预装**（镜像内含 `unrar` + `p7zip-full` + Python `rarfile`），第一试卷网 RAR 自动入库**开箱即用**。
 
-   ```bash
-   cd jianti-exam-system
-   docker compose up -d --build
-   docker compose logs -f    # 查看启动日志
-   ```
+**方式 B · 本地构建（需要把源码上传到 NAS，第一次慢）**
 
-3. 打开浏览器访问 `http://<群晋IP>:3050`，去 `/register` 注册第一个教师（即 admin）。
+```bash
+# 在源码根目录下
+cd jianti-exam-system
+docker compose -f deploy/nas/docker-compose.yml up -d --build
+```
 
-关键配置（compose 内已设置）：
+**方式 C · GitHub 手动发布**（如果你要推自己的镜像）
+
+仓库自带 `.github/workflows/publish-docker.yml`，`push main` 自动 build + push 到 `ghcr.io/wxgoo/jianti-exam-system:latest`。打 tag `v1.0.0` 会同时发 `ghcr.io/wxgoo/jianti-exam-system:v1.0.0`。
+
+**compose 关键配置**（文件里已设置好）：
 
 | 变量/配置 | 值 |
 |---|---|
+| 镜像 | `ghcr.io/wxgoo/jianti-exam-system:latest`（public） |
 | `APP_BASE_URL` | `http://<群晋IP>:3050`（自行替换） |
 | `JIANTI_WEB_PORT` | 3050（Web，必需） |
 | `JIANTI_API_PORT` | 3051（API，可选映射） |
-| `jianti_data` 卷 | 容器内 `/app/data`（SQLite 数据库 + 文件存储 `data/files/`） |
+| `jianti_data` 卷 | 容器内 `/app/data`（SQLite + 上传文件，**持久化**） |
+| 重启策略 | `unless-stopped`（自动拉着） |
+| 健康检查 | `/api/ready` 30s 间隔，DSM 7.2+ 容器管理器显示绿/红 |
 
-注意事项：
-
-- SQLite 使用 WAL 模式（`PRAGMA journal_mode = WAL`）：数据库文件与文件存储都在 `/app/data` 下，建议把存储落在群晋本地磁盘，不要挂载 SMB/NFS 共享网盘（WAL 文件不适合共享文件系统）。
-- DSM 版本：x86_64 DSM 推荐；ARM DSM 架构需 better-sqlite3 可编译（Dockerfile 已包含 gcc/make/python3）。
-- 端口：3050 必须对外开放（Web）；3051 可不映射（API 仅局域网使用）。
-- 健康检查：`GET http://<群晋IP>:3050/api/ready` 返回 `ok: true`。
-- 用户权限：群晋 Docker 管理器可把 `jianti_data` 卷授给 DSM 用户（Volume1 中显示为普通目录）。
-- 升级/重装：`docker compose down` 后更新源码再 `up --build`；数据在卷中，重启不丢。
-
-### 11.3 其他 Linux 服务器（通用）
+**常用运维**：
 
 ```bash
-npm install && npm run build && npm start
+docker compose pull && docker compose up -d   # 升级到最新镜像
+docker compose logs -f                         # 看实时日志
+docker compose ps                              # 状态
+docker compose down                            # 停止（数据保留）
+docker compose down -v                         # ⚠️ 清卷（删数据）
 ```
 
-- 端口：Web 3050（必需）、API 3051、PDF 处理器 3052（默认本地不启动，需要 `npm run local:python` 或 `--with-python`）。
-- 防火墙放行：3050（必需）、3051（可选）。
-- 数据目录默认 `./data`，可用 `JIANTI_DATA_DIR` 改到其他位置。
-- 环境变量文件：`.env` / `.env.production` / `.env.local`（`scripts/env.mjs` 按 `.env.production`、`.env` 顺序加载）。
+**注意事项**：
+
+- SQLite 使用 WAL 模式（`PRAGMA journal_mode = WAL`）：建议把存储落在群晋本地磁盘，不要挂载 SMB/NFS 共享网盘（WAL 文件不适合共享文件系统）
+- DSM 版本：x86_64 推荐；ARM 架构群晖需改 Dockerfile 用 `node:22-alpine` + 交叉编译
+- 端口：3050 必须对外开放（Web）；3051 可不映射（API 仅内部使用）
+- 群晖容器管理器里可把 `jianti_data` 卷授给 DSM 用户（Volume1 中显示为普通目录）
+- 想接域名反代理：群晖 DSM → 控制面板 → 应用程序门户 → 反向代理 → 来源 `localhost:3050` → 自定义域名
+
+### 11.1.2 Windows NSSM 开机服务（生产推荐）
+
+如果希望开机自动启动、崩溃自动重启，用 NSSM 注册成 Windows 服务：
+
+```powershell
+cd jianti-exam-system
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\deploy\install-windows-service.ps1
+```
+
+脚本自动：探测 nssm（没有则 winget install）→ 检查 Node 版本 → npm ci + build → `nssm install jianti-exam` → 设置自动启动 + 故障重启 + 日志滚动 → 启动 → 轮询就绪。
+
+成功后看到：
+```
+========================================
+  部署完成 — 服务已就绪
+========================================
+  Web:     http://127.0.0.1:3050
+```
+
+**运维命令**：
+
+```powershell
+sc.exe query jianti-exam                     # 查状态
+nssm restart jianti-exam                    # 重启（代码更新后）
+.\scripts\deploy\uninstall-windows-service.ps1   # 卸载
+Get-Content .runtime\logs\service.err.log -Wait   # 实时看错误日志
+```
+
+**可选参数**：
+
+```powershell
+.\scripts\deploy\install-windows-service.ps1 `
+  -ServiceName jianti-exam -WebPort 3050 -ApiPort 3051 `
+  -BaseUrl https://exam.yourdomain.com
+```
+
+解压后端提示：脚本会自动检查 unrar/7z 是否在 PATH。缺失时建议先 `winget install -e --id=7zip.7zip`。
+
+### 11.3 其他 Linux 服务器（通用，非 Docker）
+
+```bash
+npm ci && npm run build && npm start
+```
+
+- 端口：Web 3050（必需）、API 3051
+- 解压后端：`apt-get install unrar p7zip-full`（或走 Docker 方案更省心）
+- 防火墙放行：3050（必需）、3051（可选）
+- 数据目录默认 `.runtime/data`，可用 `JIANTI_DATA_DIR` 改到其他位置
 
 ### 11.4 管理员账号说明
 
